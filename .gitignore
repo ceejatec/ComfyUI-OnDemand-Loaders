@@ -165,3 +165,4 @@ cython_debug/
 # Local model configuration (written by the loaders when a new model URL is entered)
 config.json
 config.json.tmp
+config.json.bak

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import shutil
 import requests
 import sys
 import logging
@@ -17,6 +18,7 @@ from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
 from comfy_extras.nodes_model_patch import ModelPatchLoader
 from .sources import get_source
+from .config_transfer import export_sections, plan_import, apply_import, count_changes
 from .model_paths import (check_model_name, check_server_filename, check_subfolder, normalize_subfolder, list_subfolders,
                           model_extension, named_model_path, find_named_model_file, relative_model_path, server_filename)
 
@@ -153,6 +155,27 @@ def load_config(config_filename="config.json", quiet=False):
 
 _config_write_lock = threading.Lock()
 
+def _read_config_file(config_path):
+    """
+    Returns the contents of config.json as stored (without the "None" entries load_config adds), or {} if it does not exist.
+    Raises if it cannot be read or parsed; callers must then not overwrite it.
+    """
+    try:
+        with open(config_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+def _write_config_file(config_path, config):
+    """
+    Replaces config.json with config, atomically so it is never left half-written.
+    """
+    tmp_path = config_path + ".tmp"
+    with open(tmp_path, 'w') as f:
+        json.dump(config, f, indent=4)
+        f.write("\n")
+    os.replace(tmp_path, config_path)
+
 def _update_config_entry(model_type_key, model_name, changes, create=False):
     """
     Applies changes ({field: value}; None removes the field) to the config.json entry named model_name.
@@ -161,10 +184,7 @@ def _update_config_entry(model_type_key, model_name, changes, create=False):
     config_path = _get_config_path()
     with _config_write_lock:
         try:
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-        except FileNotFoundError:
-            config = {}
+            config = _read_config_file(config_path)
         except Exception as e:
             # Never overwrite a config file we could not parse
             logger.error(f"Not saving '{model_name}' to '{config_path}': could not read existing configuration: {e}")
@@ -185,11 +205,7 @@ def _update_config_entry(model_type_key, model_name, changes, create=False):
                 entry[field] = value
 
         try:
-            tmp_path = config_path + ".tmp"
-            with open(tmp_path, 'w') as f:
-                json.dump(config, f, indent=4)
-                f.write("\n")
-            os.replace(tmp_path, config_path)
+            _write_config_file(config_path, config)
         except Exception as e:
             logger.error(f"Error writing '{config_path}': {e}")
             return False
@@ -611,6 +627,60 @@ async def subfolders_handler(request):
         return web.json_response({"error": f"Unknown model list '{model_type_key}'"}, status=400)
     models_dir = os.path.join(folder_paths.models_dir, MODEL_DIRS[model_type_key])
     return web.json_response({"subfolders": await asyncio.to_thread(list_subfolders, models_dir)})
+
+@server.PromptServer.instance.routes.get("/on_demand_loader/export")
+async def export_handler(request):
+    """
+    Returns the config.json sections listed in ?keys=a,b (all model sections without it), for saving to a file.
+    """
+    keys = [key for key in request.query.get("keys", "").split(",") if key] or None
+    if keys and any(key not in MODEL_DIRS for key in keys):
+        return web.json_response({"error": f"Unknown model lists: {', '.join(k for k in keys if k not in MODEL_DIRS)}"}, status=400)
+    try:
+        config = _read_config_file(_get_config_path())
+    except Exception as e:
+        return web.json_response({"error": f"Could not read config.json: {e}"}, status=500)
+    if keys is None:
+        keys = [key for key in config if key in MODEL_DIRS]
+    return web.json_response(export_sections(config, keys))
+
+MAX_IMPORT_SIZE = 10 * 1024 * 1024
+
+@server.PromptServer.instance.routes.post("/on_demand_loader/import")
+async def import_handler(request):
+    """
+    Merges an exported configuration into config.json. Body: {"config": <exported file>, "apply": bool, "use_imported": bool}.
+    Without apply, only reports what would change. Conflicts (same name, different URL) keep the existing entry
+    unless use_imported. config.json is saved as config.json.bak before it is changed.
+    """
+    if (request.content_length or 0) > MAX_IMPORT_SIZE:
+        return web.json_response({"error": "The file is too large to be an exported configuration."}, status=413)
+    data = await request.json()
+    imported, apply, use_imported = data.get("config"), bool(data.get("apply")), bool(data.get("use_imported"))
+    config_path = _get_config_path()
+
+    with _config_write_lock:
+        try:
+            config = _read_config_file(config_path)
+        except Exception as e:
+            return web.json_response({"error": f"config.json could not be read, so nothing can be imported into it: {e}"}, status=500)
+        plan = plan_import(config, imported, MODEL_DIRS.keys(), LOCAL_PREFIX)
+        summary = {"sections": plan["sections"], "skipped_sections": plan["skipped_sections"],
+                   "changes": {"keep": count_changes(plan, False), "imported": count_changes(plan, True)}}
+        if not apply:
+            return web.json_response(summary)
+
+        changes = count_changes(plan, use_imported)
+        if changes:
+            try:
+                if os.path.exists(config_path):
+                    shutil.copy2(config_path, config_path + ".bak")
+                _write_config_file(config_path, apply_import(config, plan, use_imported))
+            except Exception as e:
+                logger.error(f"Error writing '{config_path}': {e}")
+                return web.json_response({"error": f"Could not write config.json: {e}"}, status=500)
+            logger.info(f"Imported {changes} model change(s) into {os.path.basename(config_path)}; the previous version is in {os.path.basename(config_path)}.bak")
+    return web.json_response({**summary, "applied": changes})
 
 
 class OnDemandLoraLoader:

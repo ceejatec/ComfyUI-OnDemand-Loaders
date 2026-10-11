@@ -181,20 +181,56 @@ async function promptNewModelName(node, link) {
 	node.setDirtyCanvas?.(true, true);
 }
 
+// A <dialog> with this extension's styling, from HTML whose .ondemand-title element receives title. Not yet shown.
+function makeDialog(title, html) {
+	const dialog = document.createElement("dialog");
+	dialog.style.cssText = `
+		padding: 20px; width: min(520px, calc(100vw - 32px)); box-sizing: border-box;
+		border: 1px solid var(--border-color, #444); border-radius: 8px;
+		background: var(--comfy-menu-bg, #202020); color: var(--fg-color, #ddd);
+		font: 14px sans-serif;`;
+	dialog.innerHTML = html;
+	dialog.querySelector(".ondemand-title").textContent = title;
+	for (const el of dialog.querySelectorAll("input:not([type=radio]), button")) {
+		el.style.cssText = `
+			padding: 6px 10px; border-radius: 6px; font: inherit;
+			border: 1px solid var(--border-color, #444);
+			background: var(--comfy-input-bg, #2a2a2a); color: var(--input-text, #ddd);`;
+	}
+	return dialog;
+}
+
+// Shows a dialog from makeDialog as a modal and returns a promise for its result. setup(finish, isFinished) wires up the
+// dialog; finish(value) closes it and resolves the promise with value. Escape resolves to null. The result does not
+// wait for the dialog's close event, which browsers may hold back while the page is not being rendered.
+function runDialog(dialog, setup) {
+	return new Promise((resolve) => {
+		let finished = false;
+		const finish = (value) => {
+			if (finished) return;
+			finished = true;
+			if (dialog.open) dialog.close();
+			dialog.remove();
+			resolve(value);
+		};
+		dialog.addEventListener("cancel", (e) => {
+			e.preventDefault();
+			finish(null);
+		});
+		dialog.addEventListener("close", () => finish(null));
+		document.body.appendChild(dialog);
+		dialog.showModal();
+		setup(finish, () => finished);
+	});
+}
+
 // Modal asking for a download URL, optional subfolder and optional model name. check(url, subfolder, name) resolves to
 // { name } (the full name, including the subfolder) or { error }; listSubfolders() resolves to existing subfolders.
 // The dialog resolves to { name, url }, or null if cancelled.
 function showNewModelDialog(title, check, listSubfolders) {
-	return new Promise((resolve) => {
-		const dialog = document.createElement("dialog");
-		dialog.style.cssText = `
-			padding: 20px; width: min(480px, calc(100vw - 32px)); box-sizing: border-box;
-			border: 1px solid var(--border-color, #444); border-radius: 8px;
-			background: var(--comfy-menu-bg, #202020); color: var(--fg-color, #ddd);
-			font: 14px sans-serif;`;
-		dialog.innerHTML = `
+	const dialog = makeDialog(title, `
 			<form method="dialog" style="display: flex; flex-direction: column; gap: 12px; margin: 0;">
-				<div style="font-size: 16px; font-weight: 600;"></div>
+				<div class="ondemand-title" style="font-size: 16px; font-weight: 600;"></div>
 				<div style="color: var(--descrip-text, #999);">The model is added to config.json and downloaded when the workflow runs.</div>
 				<label style="display: flex; flex-direction: column; gap: 4px;">URL
 					<input name="url" required autocomplete="off" placeholder="https://civitai.com/api/download/models/... or https://huggingface.co/.../resolve/...">
@@ -213,15 +249,9 @@ function showNewModelDialog(title, check, listSubfolders) {
 					<button type="button" value="cancel">Cancel</button>
 					<button type="submit" value="ok">Add model</button>
 				</div>
-			</form>`;
-		dialog.querySelector("div").textContent = title;
-		for (const el of dialog.querySelectorAll("input, button")) {
-			el.style.cssText = `
-				padding: 6px 10px; border-radius: 6px; font: inherit;
-				border: 1px solid var(--border-color, #444);
-				background: var(--comfy-input-bg, #2a2a2a); color: var(--input-text, #ddd);`;
-		}
+			</form>`);
 
+	return runDialog(dialog, (finish, isFinished) => {
 		const form = dialog.querySelector("form");
 		const errorEl = dialog.querySelector(".ondemand-error");
 		const submitButton = dialog.querySelector('button[type="submit"]');
@@ -230,7 +260,6 @@ function showNewModelDialog(title, check, listSubfolders) {
 			errorEl.hidden = !message;
 		};
 
-		let result = null;
 		form.addEventListener("submit", async (e) => {
 			e.preventDefault();
 			const url = form.elements.url.value.trim();
@@ -245,24 +274,19 @@ function showNewModelDialog(title, check, listSubfolders) {
 			} catch (err) {
 				checked = { error: `Could not check the model: ${err}` };
 			}
-			if (!dialog.open) return; // Cancelled while checking
+			if (isFinished()) return; // Cancelled while checking
 			form.querySelectorAll("input, button").forEach((el) => (el.disabled = false));
 			submitButton.textContent = "Add model";
 			if (checked.error) {
 				showError(checked.error);
 				return;
 			}
-			result = { name: checked.name, url };
-			dialog.close();
+			finish({ name: checked.name, url });
 		});
-		dialog.querySelector('button[value="cancel"]').addEventListener("click", () => dialog.close());
+		dialog.querySelector('button[value="cancel"]').addEventListener("click", () => finish(null));
 		// Whitespace-only URLs pass `required`; reject them like empty ones
 		const urlInput = form.elements.url;
 		urlInput.addEventListener("input", () => urlInput.setCustomValidity(urlInput.value.trim() ? "" : "Required"));
-		dialog.addEventListener("close", () => {
-			dialog.remove();
-			resolve(result);
-		});
 
 		listSubfolders()
 			.then((subfolders) => {
@@ -275,8 +299,6 @@ function showNewModelDialog(title, check, listSubfolders) {
 			})
 			.catch((err) => console.error("[ComfyUI-OnDemand-Loaders] Failed to list subfolders", err));
 
-		document.body.appendChild(dialog);
-		dialog.showModal();
 		urlInput.focus();
 	});
 }
@@ -318,6 +340,203 @@ function setupUrlWidgets(nodeType, links) {
 	};
 }
 
+// Exporting and importing config.json, from the node's right-click menu
+
+const SECTION_LABELS = {
+	loras: "LoRA",
+	diffusion_models: "diffusion",
+	checkpoints: "checkpoint",
+	vae_models: "VAE",
+	clip_models: "CLIP",
+	clip_vision: "CLIP Vision",
+	gguf_models: "GGUF",
+	controlnet_models: "ControlNet",
+	model_patches: "model patch",
+};
+
+function notify(severity, summary, detail) {
+	const toast = app.extensionManager?.toast;
+	if (toast?.add) {
+		toast.add({ severity, summary, detail, life: severity === "error" ? 8000 : 4000 });
+	} else {
+		(severity === "error" ? console.error : console.log)(`[ComfyUI-OnDemand-Loaders] ${summary}: ${detail}`);
+	}
+}
+
+// Saves the given config.json sections (all of them if keys is null) as a file through the browser
+async function exportModels(keys) {
+	try {
+		const params = keys ? `?${new URLSearchParams({ keys: keys.join(",") })}` : "";
+		const response = await api.fetchApi(`/on_demand_loader/export${params}`);
+		const data = await response.json();
+		if (response.status !== 200) throw new Error(data.error ?? `HTTP ${response.status}`);
+
+		const blob = new Blob([JSON.stringify(data, null, 4) + "\n"], { type: "application/json" });
+		const link = document.createElement("a");
+		link.href = URL.createObjectURL(blob);
+		link.download = keys?.length === 1 ? `ondemand-${keys[0]}.json` : "ondemand-models.json";
+		link.click();
+		setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+	} catch (e) {
+		notify("error", "Export failed", String(e.message ?? e));
+	}
+}
+
+// Lets the user pick an exported file, shows what importing it would change, and merges it into config.json
+function importModels() {
+	const input = document.createElement("input");
+	input.type = "file";
+	input.accept = ".json,application/json";
+	input.addEventListener("change", async () => {
+		const file = input.files?.[0];
+		if (!file) return;
+		let config;
+		try {
+			config = JSON.parse(await file.text());
+		} catch (e) {
+			notify("error", "Import failed", `${file.name} is not a JSON file: ${e.message}`);
+			return;
+		}
+		const post = async (apply, useImported) => {
+			const response = await api.fetchApi("/on_demand_loader/import", {
+				method: "POST",
+				body: JSON.stringify({ config, apply, use_imported: useImported }),
+				headers: { "Content-Type": "application/json" },
+			});
+			const data = await response.json();
+			if (response.status !== 200) throw new Error(data.error ?? `HTTP ${response.status}`);
+			return data;
+		};
+		try {
+			const preview = await post(false, false);
+			const useImported = await showImportDialog(file.name, preview);
+			if (useImported === null) return;
+			const result = await post(true, useImported);
+			if (result.applied) {
+				notify("success", "Models imported", `${result.applied} model${result.applied === 1 ? "" : "s"} added or updated in config.json`);
+				await app.refreshComboInNodes?.();
+			}
+		} catch (e) {
+			notify("error", "Import failed", String(e.message ?? e));
+		}
+	});
+	input.click();
+}
+
+// Shows what importing would change; resolves to whether conflicts should use the imported entries, or null if cancelled
+function showImportDialog(fileName, preview) {
+	const dialog = makeDialog(`Import models from ${fileName}`, `
+			<form method="dialog" style="display: flex; flex-direction: column; gap: 12px; margin: 0;">
+				<div class="ondemand-title" style="font-size: 16px; font-weight: 600; overflow-wrap: anywhere;"></div>
+				<div class="ondemand-summary" style="display: flex; flex-direction: column; gap: 10px; max-height: 50vh; overflow-y: auto;"></div>
+				<fieldset class="ondemand-conflicts" style="border: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 4px;" hidden>
+					<legend style="padding: 0; margin-bottom: 4px;">For models in both, with different URLs:</legend>
+					<label><input type="radio" name="conflicts" value="keep" checked> Keep mine</label>
+					<label><input type="radio" name="conflicts" value="imported"> Use imported</label>
+				</fieldset>
+				<div class="ondemand-nothing" style="color: var(--descrip-text, #999);" hidden>Nothing would be added or changed.</div>
+				<div style="display: flex; justify-content: flex-end; gap: 8px;">
+					<button type="button" value="cancel">Cancel</button>
+					<button type="submit" value="ok">Import</button>
+				</div>
+			</form>`);
+
+	return runDialog(dialog, (finish) => {
+		const summary = dialog.querySelector(".ondemand-summary");
+		const muted = "color: var(--descrip-text, #999);";
+		const addLine = (parent, text, style = "") => {
+			const line = document.createElement("div");
+			line.textContent = text;
+			line.style.cssText = style;
+			parent.appendChild(line);
+			return line;
+		};
+		const addList = (parent, items) => {
+			const list = document.createElement("ul");
+			list.style.cssText = `margin: 2px 0 0; padding-left: 20px; ${muted} overflow-wrap: anywhere;`;
+			for (const item of items) {
+				const li = document.createElement("li");
+				li.textContent = item;
+				list.appendChild(li);
+			}
+			parent.appendChild(list);
+		};
+
+		let conflictCount = 0;
+		for (const [key, section] of Object.entries(preview.sections)) {
+			const block = document.createElement("div");
+			const counts = [
+				`${section.added.length} new`,
+				`${section.unchanged.length + section.hash_added.length} already present`,
+				section.conflicts.length && `${section.conflicts.length} with a different URL`,
+				section.skipped.length && `${section.skipped.length} skipped`,
+			].filter(Boolean);
+			addLine(block, `${SECTION_LABELS[key] ?? key} models: ${counts.join(", ")}`, "font-weight: 600;");
+			if (section.conflicts.length) {
+				addList(block, section.conflicts.map((c) => `${c.name}: mine ${c.url}, imported ${c.imported_url}`));
+			}
+			if (section.offline.length) {
+				addLine(block, `New offline models only work if their files are already on this computer: ${section.offline.join(", ")}`, muted);
+			}
+			if (section.skipped.length) {
+				addLine(block, "Skipped:", muted);
+				addList(block, section.skipped.map((s) => `${s.name ?? "(entry without a name)"}: ${s.reason}`));
+			}
+			conflictCount += section.conflicts.length;
+			summary.appendChild(block);
+		}
+		if (preview.skipped_sections.length) {
+			const block = document.createElement("div");
+			addLine(block, "Skipped parts of the file:", muted);
+			addList(block, preview.skipped_sections.map((s) => (s.key ? `${s.key}: ${s.reason}` : s.reason)));
+			summary.appendChild(block);
+		}
+
+		const form = dialog.querySelector("form");
+		const importButton = dialog.querySelector('button[type="submit"]');
+		const nothing = dialog.querySelector(".ondemand-nothing");
+		// Set display rather than the hidden attribute, which the fieldset's inline display: flex would override
+		dialog.querySelector(".ondemand-conflicts").style.display = conflictCount ? "flex" : "none";
+		if (conflictCount) {
+			// Here nothing changes only because "Keep mine" ignores the conflicts, so point that out
+			nothing.replaceChildren();
+			const icon = document.createElement("span");
+			icon.textContent = "⚠ ";
+			icon.setAttribute("aria-hidden", "true");
+			nothing.append(icon, `Nothing would be added or changed. Choose "Use imported" to update the ` +
+				`${conflictCount === 1 ? "model" : `${conflictCount} models`} with a different URL.`);
+			nothing.style.color = "var(--warning-text, #f0b400)";
+		}
+		const useImported = () => form.elements.conflicts?.value === "imported";
+		const update = () => {
+			const changes = useImported() ? preview.changes.imported : preview.changes.keep;
+			importButton.disabled = changes === 0;
+			nothing.hidden = changes !== 0;
+		};
+		form.addEventListener("change", update);
+		update();
+
+		form.addEventListener("submit", (e) => {
+			e.preventDefault();
+			finish(useImported());
+		});
+		dialog.querySelector('button[value="cancel"]').addEventListener("click", () => finish(null));
+	});
+}
+
+// Menu items for a loader node with url fields: export its sections, export everything, import
+function getTransferMenuItems(node) {
+	const links = node.constructor.ondemandUrlLinks;
+	if (!links?.length) return [];
+	const keys = [...new Set(links.map((link) => link.configKey))];
+	return [
+		null,
+		...keys.map((key) => ({ content: `Export ${SECTION_LABELS[key] ?? key} models…`, callback: () => exportModels([key]) })),
+		{ content: "Export all models…", callback: () => exportModels(null) },
+		{ content: "Import models…", callback: () => importModels() },
+	];
+}
+
 // When a run adds a model to config.json, offer it in the dropdowns of matching nodes
 api.addEventListener("ondemand_loaders.config_updated", ({ detail }) => {
 	for (const node of app.graph?.nodes ?? []) {
@@ -333,6 +552,9 @@ api.addEventListener("ondemand_loaders.config_updated", ({ detail }) => {
 
 app.registerExtension({
 	name: "comfy.francarl.onDemandLoader",
+	getNodeMenuItems(node) {
+		return getTransferMenuItems(node);
+	},
 	async beforeRegisterNodeDef(nodeType, nodeData, app) {
 		const urlLinks = getUrlLinks(nodeData);
 		if (urlLinks.length > 0) {

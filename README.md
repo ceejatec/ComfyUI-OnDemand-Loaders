@@ -139,6 +139,16 @@ Once a model's file exists, it is loaded without contacting the server. Names mu
 
 The drop-down also lists model files that are already in ComfyUI's model folders (including folders from `extra_model_paths.yaml`) but not in `config.json`, after the configured models and marked `[local]`, such as `[local] sdxl/my_lora.safetensors`. Selecting one shows `<local>` in the `url` field, and the file is loaded as is, without contacting any server. Files that belong to a `config.json` entry (named after it) are not listed again. Models downloaded by earlier versions, stored under the server's file name, are listed as local as well as under their `config.json` name; renaming such a file to its model name removes the duplicate.
 
+### Exporting and importing models
+
+Right-click a loader node to export or import its models:
+
+*   **Export *type* models…** saves that node's section of `config.json` (for example `loras` for the Lora Loader) as a file.
+*   **Export all models…** saves all sections.
+*   **Import models…** merges an exported file into `config.json`. Before anything is changed, a summary shows what would be added, which models are already present, and which have a different URL than yours; for those, choose **Keep mine** or **Use imported**. Nothing is removed. Entries that cannot be used, such as unsafe names or URLs that are not `http(s)`, are skipped and listed. The previous `config.json` is saved as `config.json.bak`.
+
+Exported files contain only model names, URLs and hashes; API keys are never stored in `config.json`.
+
 ### Download verification
 
 When a model is downloaded, its SHA256 hash is recorded in its `config.json` entry as `sha256`. Downloads are verified against the hash that Civitai or HuggingFace publishes for the file, or, for other sites, against the hash recorded by an earlier download. A download that does not match is discarded and the workflow stops with an error. If a model was intentionally replaced on a site that does not publish hashes, remove `sha256` from its entry. Changing a model's URL also removes its recorded hash.
@@ -173,6 +183,11 @@ This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.tx
 This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https://github.com/Azornes/Comfyui-Resolution-Master) by Azornes.
 
 ## Changelog
+
+### Unreleased
+
+- **New Feature**:
+    - Export and import models from a loader node's right-click menu: export one section or all of `config.json`, and merge an exported file into it after reviewing a summary.
 
 ### 1.1.0
 
