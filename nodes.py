@@ -3,11 +3,14 @@ import os
 import requests
 import sys
 import logging
+import threading
 from tqdm import tqdm
 import re
 import folder_paths
 from pathlib import Path
 import importlib.util
+import server
+from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
 from comfy_extras.nodes_model_patch import ModelPatchLoader
 
@@ -35,7 +38,7 @@ if module_path.exists():
     try:
         spec = importlib.util.spec_from_file_location(module_name, str(module_path))
         module_gguf = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module_gguf 
+        sys.modules[spec.name] = module_gguf
         spec.loader.exec_module(module_gguf)
 
         logger.info(f"Successfully found and imported UnetLoaderGGUF dynamically.")
@@ -52,18 +55,23 @@ else:
     logger.warning(f"OnDemand GGUF Loaders will not be available")
 
 
-# Function to load configuration 
-def load_config(config_filename="config.json"):
-    
+def _get_config_path(config_filename="config.json"):
+    """
+    Returns the path of the configuration file: ONDEMAND_LOADERS_CONFIG_PATH if that file exists, else config.json next to this file.
+    """
     config_path_env = os.environ.get('ONDEMAND_LOADERS_CONFIG_PATH')
     if config_path_env and os.path.exists(config_path_env):
-        config_path = config_path_env
-        config_filename = os.path.basename(config_path)
-    else:
-        current_dir = os.path.dirname(__file__)
-        config_path = os.path.join(current_dir, config_filename)
-    
-    default_config = { 
+        return config_path_env
+    return os.path.join(os.path.dirname(__file__), config_filename)
+
+
+# Function to load configuration
+def load_config(config_filename="config.json", quiet=False):
+
+    config_path = _get_config_path(config_filename)
+    config_filename = os.path.basename(config_path)
+
+    default_config = {
         "loras": [
             {
                 "name": "Lora n1",
@@ -79,7 +87,8 @@ def load_config(config_filename="config.json"):
     try:
         with open(config_path, 'r') as f:
             config = json.load(f)
-        logger.info(f"Successfully loaded configuration from {config_filename}")
+        if not quiet:
+            logger.info(f"Successfully loaded configuration from {config_filename}")
 
         # add None to all lists
         for key in config:
@@ -90,7 +99,8 @@ def load_config(config_filename="config.json"):
 
         return config
     except FileNotFoundError:
-        logger.warning(f"Configuration file '{config_path}' not found. Using default fallback configuration.")
+        if not quiet:
+            logger.warning(f"Configuration file '{config_path}' not found. Using default fallback configuration.")
         return default_config
     except json.JSONDecodeError:
         logger.error(f"Error decoding JSON from '{config_path}'. Using default fallback configuration.")
@@ -98,6 +108,47 @@ def load_config(config_filename="config.json"):
     except Exception as e:
         logger.error(f"An unexpected error occurred while loading '{config_path}': {e}. Using default fallback.")
         return default_config
+
+
+_config_write_lock = threading.Lock()
+
+def _save_model_to_config(model_type_key, model_name, model_url):
+    """
+    Adds a model entry to config.json, or updates the URL of an existing entry with the same name.
+    Returns True if the file was written.
+    """
+    config_path = _get_config_path()
+    with _config_write_lock:
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            config = {}
+        except Exception as e:
+            # Never overwrite a config file we could not parse
+            logger.error(f"Not saving '{model_name}' to '{config_path}': could not read existing configuration: {e}")
+            return False
+
+        models = config.setdefault(model_type_key, [])
+        entry = next((m for m in models if m.get("name") == model_name), None)
+        if entry:
+            entry["url"] = model_url
+        else:
+            models.append({"name": model_name, "url": model_url})
+
+        try:
+            tmp_path = config_path + ".tmp"
+            with open(tmp_path, 'w') as f:
+                json.dump(config, f, indent=4)
+                f.write("\n")
+            os.replace(tmp_path, config_path)
+        except Exception as e:
+            logger.error(f"Error writing '{config_path}': {e}")
+            return False
+
+    logger.info(f"{'Updated' if entry else 'Added'} '{model_name}' in '{model_type_key}' of {os.path.basename(config_path)}")
+    server.PromptServer.instance.send_sync("ondemand_loaders.config_updated", {"key": model_type_key, "name": model_name, "url": model_url})
+    return True
 
 def _get_api_key_for_url(model_url, api_key_param):
     """
@@ -115,14 +166,14 @@ def _get_api_key_for_url(model_url, api_key_param):
 def _download_model(model_url, model_name, destination_dir, api_key, download_chunks):
     """
     Handles the download of a model from a given URL to a specified directory.
-    
+
     Args:
         model_url (str): The URL of the model to download.
         model_name (str): The name of the model (for logging purposes).
         destination_dir (str): The directory where the model should be saved.
         api_key (str): API key for authentication, if required.
         download_chunks (int): The size of download chunks in KB.
-        
+
     Returns:
         str: The full path to the downloaded model file, or None if an error occurred.
     """
@@ -153,7 +204,7 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         filename_match = re.search(r'filename="?([^"]+)"?', content_disposition)
         if filename_match:
             model_filename = filename_match.group(1).strip()
-    
+
     if not model_filename:
         # Fallback to extracting filename from URL if Content-Disposition is missing or malformed
         model_filename = os.path.basename(model_url)
@@ -179,20 +230,54 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
             logger.error(f"An unexpected error occurred during download of '{model_name}': {e}")
             return None
 
-def _get_model_url_from_config(model_name, model_type_key):
+def _get_model_url_from_config(model_name, model_type_key, log_missing=True):
     """
-    Retrieves the URL for a given model name from the NODE_CONFIG.
+    Retrieves the URL for a given model name from config.json (re-read so edits are picked up without a restart).
     """
     model_url = None
-    for model in NODE_CONFIG.get(model_type_key, []):
+    for model in load_config(quiet=True).get(model_type_key, []):
         if model["name"] == model_name:
             model_url = model["url"]
             break
-    if not model_url:
+    if not model_url and log_missing:
         logger.error(f"Model URL not found for name: {model_name} in {model_type_key}")
     return model_url
 
-NODE_CONFIG = load_config()
+def _resolve_model_url(model_name, model_type_key, url):
+    """
+    Returns the URL to download model_name from. A URL entered in the node takes precedence, and is
+    saved to config.json if it is new or differs from the configured one; otherwise config.json is used.
+    """
+    url = (url or "").strip()
+    if url and model_name != "None":
+        if _get_model_url_from_config(model_name, model_type_key, log_missing=False) != url:
+            _save_model_to_config(model_type_key, model_name, url)
+        return url
+    return _get_model_url_from_config(model_name, model_type_key)
+
+def _validate_model_choice(model_name, model_type_key, url):
+    """
+    VALIDATE_INPUTS helper: the model name may be any name in config.json, or a new name if a URL is given.
+    """
+    if model_name == "None" or (url or "").strip() or _get_model_url_from_config(model_name, model_type_key, log_missing=False):
+        return True
+    return f"'{model_name}' is not in config.json ({model_type_key}); enter its download URL in the url field"
+
+URL_TOOLTIP = "Download URL of the selected model, filled in from config.json. Enter a new name and URL to add the model to config.json, or change the URL to update it."
+
+def _url_input(model_type_key, name_input):
+    """
+    The url widget. The ondemand_* options tell js/onDemandLoader.js which name widget and config.json list it belongs to.
+    """
+    return ("STRING", {"default": "", "multiline": False, "tooltip": URL_TOOLTIP,
+                       "ondemand_config_key": model_type_key, "ondemand_name_input": name_input})
+
+
+@server.PromptServer.instance.routes.get("/on_demand_loader/model_url")
+async def model_url_handler(request):
+    model_url = _get_model_url_from_config(request.query.get("name"), request.query.get("key"), log_missing=False)
+    return web.json_response({"url": model_url or ""})
+
 
 class OnDemandLoraLoader:
 
@@ -201,7 +286,7 @@ class OnDemandLoraLoader:
 
         NODE_CONFIG = load_config()
         loras = [lora["name"] for lora in NODE_CONFIG.get("loras", []) ]
-       
+
         return {
             "required": {
                 "model": ("MODEL",),
@@ -212,9 +297,14 @@ class OnDemandLoraLoader:
             "optional": {
                 "clip": ("CLIP", ),
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("loras", "lora_name")
             }
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, lora_name, url=None):
+        return _validate_model_choice(lora_name, "loras", url)
 
     RETURN_TYPES = ("MODEL", "CLIP")
     RETURN_NAMES = ("model", "clip")
@@ -223,12 +313,12 @@ class OnDemandLoraLoader:
 
     CATEGORY = "loaders"
 
-    def download_lora(self, model, lora_name, strength_model, strength_clip, clip=None, api_key=None, download_chunks=None):
+    def download_lora(self, model, lora_name, strength_model, strength_clip, clip=None, api_key=None, download_chunks=None, url=None):
         self.lora_loader = LoraLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "loras")
 
-        lora_url = _get_model_url_from_config(lora_name, "loras")
+        lora_url = _resolve_model_url(lora_name, "loras", url)
         if not lora_url:
             return model, clip # Return original model/clip if URL not found
 
@@ -252,7 +342,7 @@ class OnDemandUNETLoader:
 
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("diffusion_models", []) ]
-       
+
         return {
             "required": {
                 "unet_name": (models,),
@@ -260,9 +350,14 @@ class OnDemandUNETLoader:
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("diffusion_models", "unet_name")
             }
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, unet_name, url=None):
+        return _validate_model_choice(unet_name, "diffusion_models", url)
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "download_unet"
@@ -270,12 +365,12 @@ class OnDemandUNETLoader:
 
     CATEGORY = "loaders"
 
-    def download_unet(self, unet_name, weight_dtype, api_key=None, download_chunks=None):
+    def download_unet(self, unet_name, weight_dtype, api_key=None, download_chunks=None, url=None):
         self.unet_loader = UNETLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "diffusion_models")
 
-        model_url = _get_model_url_from_config(unet_name, "diffusion_models")
+        model_url = _resolve_model_url(unet_name, "diffusion_models", url)
         if not model_url:
             return None
 
@@ -299,16 +394,21 @@ class OnDemandCheckpointLoader:
 
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("checkpoints", []) ]
-       
+
         return {
             "required": {
                 "ckpt_name": (models,)
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("checkpoints", "ckpt_name")
             }
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, ckpt_name, url=None):
+        return _validate_model_choice(ckpt_name, "checkpoints", url)
 
     RETURN_TYPES = ("MODEL", "CLIP", "VAE")
     OUTPUT_TOOLTIPS = ("The model used for denoising latents.",
@@ -318,12 +418,12 @@ class OnDemandCheckpointLoader:
     DESCRIPTION = "Load checkpoint models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
     CATEGORY = "loaders"
 
-    def download_checkpoint(self, ckpt_name, api_key=None, download_chunks=None):
+    def download_checkpoint(self, ckpt_name, api_key=None, download_chunks=None, url=None):
         self.checkpoint_loader = CheckpointLoaderSimple()
 
         destination_dir = os.path.join(folder_paths.models_dir, "checkpoints")
 
-        model_url = _get_model_url_from_config(ckpt_name, "checkpoints")
+        model_url = _resolve_model_url(ckpt_name, "checkpoints", url)
         if not model_url:
             return None
 
@@ -339,34 +439,39 @@ class OnDemandCheckpointLoader:
         return self.checkpoint_loader.load_checkpoint(model_filename)
 
 class OnDemandVAELoader:
-    
+
     @classmethod
     def INPUT_TYPES(cls):
 
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("vae_models", []) ]
-       
+
         return {
             "required": {
                 "vae_name": (models,)
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("vae_models", "vae_name")
             }
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, vae_name, url=None):
+        return _validate_model_choice(vae_name, "vae_models", url)
 
     RETURN_TYPES = ("VAE",)
     FUNCTION = "download_vae"
     DESCRIPTION = "Load vae models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
     CATEGORY = "loaders"
 
-    def download_vae(self, vae_name, api_key=None, download_chunks=None):
+    def download_vae(self, vae_name, api_key=None, download_chunks=None, url=None):
         self.vae_loader = VAELoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "vae")
 
-        model_url = _get_model_url_from_config(vae_name, "vae_models")
+        model_url = _resolve_model_url(vae_name, "vae_models", url)
         if not model_url:
             return None
 
@@ -389,26 +494,32 @@ class OnDemandCLIPLoader:
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("clip_models", []) ]
 
-        return {"required": { 
+        return {"required": {
                                 "clip_name": (models,),
                                 "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image"], ),
                               },
                 "optional": {
                                 "device": (["default", "cpu"], {"advanced": True}),
                                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                                "url": _url_input("clip_models", "clip_name")
                              }}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, clip_name, url=None):
+        return _validate_model_choice(clip_name, "clip_models", url)
+
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "download_clip"
     CATEGORY = "loaders"
     DESCRIPTION = "Load clip models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
 
-    def download_clip(self, clip_name, type="stable_diffusion", device="default", api_key=None, download_chunks=None):
+    def download_clip(self, clip_name, type="stable_diffusion", device="default", api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "text_encoders")
 
-        model_url = _get_model_url_from_config(clip_name, "clip_models")
+        model_url = _resolve_model_url(clip_name, "clip_models", url)
         if not model_url:
             return None
 
@@ -432,7 +543,7 @@ class OnDemandDualCLIPLoader:
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("clip_models", []) ]
 
-        return {"required": { 
+        return {"required": {
                                 "clip_name1": (models,),
                                 "clip_name2": (models,),
                                 "type": (["sdxl", "sd3", "flux", "hunyuan_video", "hidream", "hunyuan_image", "hunyuan_video_15"], ),
@@ -440,20 +551,30 @@ class OnDemandDualCLIPLoader:
                 "optional": {
                                 "device": (["default", "cpu"], {"advanced": True}),
                                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                                "url1": _url_input("clip_models", "clip_name1"),
+                                "url2": _url_input("clip_models", "clip_name2")
                              }}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, clip_name1, clip_name2, url1=None, url2=None):
+        result = _validate_model_choice(clip_name1, "clip_models", url1)
+        if result is not True:
+            return result
+        return _validate_model_choice(clip_name2, "clip_models", url2)
+
     RETURN_TYPES = ("CLIP",)
     FUNCTION = "download_clip"
     CATEGORY = "loaders"
     DESCRIPTION = "Load (dual) clip models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
 
-    def download_clip(self, clip_name1, clip_name2, type, device="default", api_key=None, download_chunks=None):
+    def download_clip(self, clip_name1, clip_name2, type, device="default", api_key=None, download_chunks=None, url1=None, url2=None):
         self.clip_loader = DualCLIPLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "text_encoders")
 
         # clip_name1
-        model_url1 = _get_model_url_from_config(clip_name1, "clip_models")
+        model_url1 = _resolve_model_url(clip_name1, "clip_models", url1)
         if not model_url1:
             return None
 
@@ -466,7 +587,7 @@ class OnDemandDualCLIPLoader:
         model_filename1 = os.path.basename(model_filepath1)
 
         # clip_name2
-        model_url2 = _get_model_url_from_config(clip_name2, "clip_models")
+        model_url2 = _resolve_model_url(clip_name2, "clip_models", url2)
         if not model_url2:
             return None
 
@@ -488,24 +609,30 @@ class OnDemandCLIPVisionLoader:
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("clip_vision", []) ]
 
-        return {"required": { 
+        return {"required": {
                                 "clip_name": (models,),
                               },
                 "optional": {
                                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                                "url": _url_input("clip_vision", "clip_name")
                              }}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, clip_name, url=None):
+        return _validate_model_choice(clip_name, "clip_vision", url)
+
     RETURN_TYPES = ("CLIP_VISION",)
     FUNCTION = "download_clip"
     CATEGORY = "loaders"
     DESCRIPTION = "Load clip vision models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
 
-    def download_clip(self, clip_name, api_key=None, download_chunks=None):
+    def download_clip(self, clip_name, api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPVisionLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "clip_vision")
 
-        model_url = _get_model_url_from_config(clip_name, "clip_vision")
+        model_url = _resolve_model_url(clip_name, "clip_vision", url)
         if not model_url:
             return None
 
@@ -528,28 +655,34 @@ class OnDemandGGUFLoader:
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("gguf_models", []) ]
 
-        return {"required": { 
-                                "unet_name": (models,)                        
+        return {"required": {
+                                "unet_name": (models,)
                               },
                 "optional": {
                                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                                "url": _url_input("gguf_models", "unet_name")
                              }}
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, unet_name, url=None):
+        return _validate_model_choice(unet_name, "gguf_models", url)
+
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "download_unet"
     CATEGORY = "loaders"
     DESCRIPTION = "Load gguf models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
 
-    def download_unet(self, unet_name, api_key=None, download_chunks=None):
+    def download_unet(self, unet_name, api_key=None, download_chunks=None, url=None):
         if module_gguf is None:
             logger.error(f"UnetLoaderGGUF class not available. Ensure ComfyUI-GGUF is installed correctly.")
             return None
-        
+
         self.gguf_loader = module_gguf.nodes.UnetLoaderGGUF()
 
         destination_dir = os.path.join(folder_paths.models_dir, "unet")
 
-        model_url = _get_model_url_from_config(unet_name, "gguf_models")
+        model_url = _resolve_model_url(unet_name, "gguf_models", url)
         if not model_url:
             return None
 
@@ -565,78 +698,39 @@ class OnDemandGGUFLoader:
         return self.gguf_loader.load_unet(model_filename)
 
 class OnDemandControlNetLoader:
-    
+
     @classmethod
     def INPUT_TYPES(cls):
 
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("controlnet_models", []) ]
-       
+
         return {
             "required": {
                 "control_net_name": (models,)
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("controlnet_models", "control_net_name")
             }
         }
 
-    RETURN_TYPES = ("CONTROL_NET",)
-    FUNCTION = "download_controlnet"
-    DESCRIPTION = "Load control_net models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
-    CATEGORY = "loaders"
-
-    def download_controlnet(self, control_net_name, api_key=None, download_chunks=None):
-        self.controlnet_loader = ControlNetLoader()
-
-        destination_dir = os.path.join(folder_paths.models_dir, "controlnet")
-
-        model_url = _get_model_url_from_config(control_net_name, "controlnet_models")
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, control_net_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None # Return None for all outputs if download fails
-
-        model_filename = os.path.basename(model_filepath)
-
-        # Load vae using the existing VAELoader
-        return self.controlnet_loader.load_controlnet(model_filename)
-
-
-class OnDemandControlNetLoader:
-    
     @classmethod
-    def INPUT_TYPES(cls):
-
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("controlnet_models", []) ]
-       
-        return {
-            "required": {
-                "control_net_name": (models,)
-            },
-            "optional": {
-                "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
-            }
-        }
+    def VALIDATE_INPUTS(cls, control_net_name, url=None):
+        return _validate_model_choice(control_net_name, "controlnet_models", url)
 
     RETURN_TYPES = ("CONTROL_NET",)
     FUNCTION = "download_controlnet"
     DESCRIPTION = "Load control_net models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
     CATEGORY = "loaders"
 
-    def download_controlnet(self, control_net_name, api_key=None, download_chunks=None):
+    def download_controlnet(self, control_net_name, api_key=None, download_chunks=None, url=None):
         self.controlnet_loader = ControlNetLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "controlnet")
 
-        model_url = _get_model_url_from_config(control_net_name, "controlnet_models")
+        model_url = _resolve_model_url(control_net_name, "controlnet_models", url)
         if not model_url:
             return None
 
@@ -653,34 +747,39 @@ class OnDemandControlNetLoader:
 
 
 class OnDemandModelPatchLoader:
-    
+
     @classmethod
     def INPUT_TYPES(cls):
 
         NODE_CONFIG = load_config()
         models = [model["name"] for model in NODE_CONFIG.get("model_patches", []) ]
-       
+
         return {
             "required": {
                 "name": (models,)
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
-                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1})
+                "download_chunks": ("INT", {"default": 4, "min": 1, "max": 12, "step": 1}),
+                "url": _url_input("model_patches", "name")
             }
         }
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, name, url=None):
+        return _validate_model_choice(name, "model_patches", url)
 
     RETURN_TYPES = ("MODEL_PATCH",)
     FUNCTION = "download_model_patch"
     DESCRIPTION = "Load model_patch models from CivitAI/HuggingFace, they will be downloaded automatically if not found.\nPut a valid CivitAI/HuggingFace API key in form field 'api_key' or in CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable to access private models"
     CATEGORY = "loaders"
 
-    def download_model_patch(self, name, api_key=None, download_chunks=None):
+    def download_model_patch(self, name, api_key=None, download_chunks=None, url=None):
         self.model_patch_loader = ModelPatchLoader()
 
         destination_dir = os.path.join(folder_paths.models_dir, "model_patches")
 
-        model_url = _get_model_url_from_config(name, "model_patches")
+        model_url = _resolve_model_url(name, "model_patches", url)
         if not model_url:
             return None
 

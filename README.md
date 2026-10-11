@@ -119,6 +119,16 @@ You can get the download link from a model's page on Civitai/HuggingFace by righ
 
 After modifying `config.json`, press "R" to reload configuration and update workflow without restarting ComfyUI.
 
+### Adding models from the node
+
+Each config-based loader has a `url` field (`url1`/`url2` on the DualCLIP loader) that shows the download URL of the selected model from `config.json`. You can also add models without editing `config.json` by hand:
+
+1.  Click **➕ New model** on the node.
+2.  Enter a name for the model and its download URL, and click **Add model**.
+3.  Run the workflow. The model is added to `config.json` and downloaded as usual, and it appears in the dropdown of the other loaders of that type.
+
+Changing the URL of an existing model and running the workflow updates its entry in `config.json` the same way.
+
 ### Using the `OnDemand Civitai Liked Lora Loader`
 
 This special node works differently from the others. Instead of using the local `config.json` file, it connects directly to the Civitai API to fetch the list of LoRA models you have marked as "Favorites".
@@ -149,6 +159,14 @@ This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.tx
 This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https://github.com/Azornes/Comfyui-Resolution-Master) by Azornes.
 
 ## Changelog
+
+### Unreleased
+
+- **New Feature**:
+    - Added a `url` field to the config-based loaders, filled in from `config.json`, and a **➕ New model** button to add models to `config.json` from the node.
+- **Bug Fixes**:
+    - Fixed a crash at startup when ComfyUI-GGUF is not installed.
+    - Changes to `config.json` are now used when a workflow runs without restarting ComfyUI.
 
 ### 1.0.17
 
