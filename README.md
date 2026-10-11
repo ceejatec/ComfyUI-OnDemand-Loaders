@@ -174,7 +174,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 
 ## Changelog
 
-### Unreleased
+### 1.1.0
 
 - **New Feature**:
     - Added a `url` field to the config-based loaders, filled in from `config.json`, and a **➕ New model** button to add models to `config.json` from the node.
