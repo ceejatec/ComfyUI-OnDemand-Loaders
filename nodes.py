@@ -7,6 +7,8 @@ import threading
 from tqdm import tqdm
 import re
 import folder_paths
+import comfy.utils
+import comfy.model_management
 from pathlib import Path
 import importlib.util
 from urllib.parse import urlparse
@@ -248,11 +250,19 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         try:
             total_size = int(response.headers.get('content-length', 0))
             block_size = (download_chunks or 4) * 1024
+            # Progress bar on the node in the ComfyUI UI; without a known size there is no progress to show
+            ui_progress_bar = comfy.utils.ProgressBar(total_size) if total_size else None
+            downloaded = 0
             with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"{LOG_PREFIX} Downloading {model_name}") as progress_bar:
                 with open(part_filepath, 'wb') as f:
                     for data in response.iter_content(block_size):
+                        # Stop when the run is cancelled in the UI
+                        comfy.model_management.throw_exception_if_processing_interrupted()
                         progress_bar.update(len(data))
                         f.write(data)
+                        downloaded += len(data)
+                        if ui_progress_bar:
+                            ui_progress_bar.update_absolute(downloaded)
             downloaded_size = os.path.getsize(part_filepath)
             # content-length is the compressed size when the response is encoded, so it can only be checked otherwise
             if total_size and not response.headers.get('Content-Encoding') and downloaded_size != total_size:
@@ -260,11 +270,17 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
             os.replace(part_filepath, model_filepath)
             logger.info(f"Successfully downloaded '{model_name}' filename {model_filename}.")
             return model_filepath
-        except Exception as e:
+        except BaseException as e:
+            # Also clean up when cancelled: ComfyUI's InterruptProcessingException is a BaseException
+            response.close()
             try:
                 os.remove(part_filepath)
             except OSError:
                 pass
+            if isinstance(e, comfy.model_management.InterruptProcessingException):
+                logger.info(f"Download of '{model_name}' cancelled.")
+            if not isinstance(e, Exception):
+                raise # Let cancellation and other non-errors through unchanged
             raise _download_error(f"Download of '{model_name}' from {model_url} failed: {e}") from e
 
 def _auth_hint(model_url, api_key):

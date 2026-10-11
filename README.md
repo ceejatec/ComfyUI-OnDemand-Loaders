@@ -164,6 +164,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 
 - **New Feature**:
     - Added a `url` field to the config-based loaders, filled in from `config.json`, and a **➕ New model** button to add models to `config.json` from the node.
+    - Model downloads show their progress on the node in the ComfyUI UI, and can be stopped with the Cancel button.
 - **Bug Fixes**:
     - Fixed a crash at startup when ComfyUI-GGUF is not installed.
     - Changes to `config.json` are now used when a workflow runs without restarting ComfyUI.
