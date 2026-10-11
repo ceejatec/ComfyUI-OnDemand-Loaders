@@ -167,6 +167,8 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 - **Bug Fixes**:
     - Fixed a crash at startup when ComfyUI-GGUF is not installed.
     - Changes to `config.json` are now used when a workflow runs without restarting ComfyUI.
+    - A failed download (for example a missing or invalid `CIVITAI_TOKEN`) now stops the workflow with an error message in the UI, instead of continuing without the model.
+    - Interrupted downloads no longer leave a partial model file that is later loaded as if it were complete.
 
 ### 1.0.17
 

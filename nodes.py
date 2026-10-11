@@ -175,7 +175,10 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         download_chunks (int): The size of download chunks in KB.
 
     Returns:
-        str: The full path to the downloaded model file, or None if an error occurred.
+        str: The full path to the downloaded model file.
+
+    Raises:
+        RuntimeError: If the model could not be downloaded; the message is shown in the ComfyUI UI.
     """
     if model_url == 'offline':
         logger.info(f"'{model_name}' is marked as offline. Assuming local file exists and skipping download.")
@@ -192,11 +195,20 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         }
 
     try:
-        response = requests.get(model_url, stream=True, allow_redirects=True, headers=headers)
+        response = requests.get(model_url, stream=True, allow_redirects=True, headers=headers, timeout=60)
         response.raise_for_status()  # Raise an exception for bad status codes
+    except requests.exceptions.HTTPError as e:
+        message = f"Could not download '{model_name}' from {model_url}: HTTP {e.response.status_code} {e.response.reason}."
+        if e.response.status_code in (401, 403):
+            message += " " + _auth_hint(model_url, api_key)
+        raise _download_error(message) from e
     except requests.exceptions.RequestException as e:
-        logger.error(f"Error making request for '{model_name}' from '{model_url}': {e}")
-        return None
+        raise _download_error(f"Could not download '{model_name}' from {model_url}: {e}") from e
+
+    # Sites answer some unauthenticated downloads with a login page instead of an error status
+    if response.headers.get('Content-Type', '').startswith('text/html'):
+        raise _download_error(f"Could not download '{model_name}' from {model_url}: the server returned a web page instead of a model file. "
+                              + _auth_hint(model_url, api_key))
 
     model_filename = None
     content_disposition = response.headers.get('Content-Disposition')
@@ -216,19 +228,48 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         return model_filepath
     else:
         logger.info(f"Downloading '{model_name}' from '{model_url}' to '{model_filepath}'")
+        # Download to a temporary file, so an interrupted download is not mistaken for a complete model next time
+        part_filepath = model_filepath + ".part"
         try:
             total_size = int(response.headers.get('content-length', 0))
-            block_size = download_chunks * 1024
+            block_size = (download_chunks or 4) * 1024
             with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"{LOG_PREFIX} Downloading {model_name}") as progress_bar:
-                with open(model_filepath, 'wb') as f:
+                with open(part_filepath, 'wb') as f:
                     for data in response.iter_content(block_size):
                         progress_bar.update(len(data))
                         f.write(data)
+            downloaded_size = os.path.getsize(part_filepath)
+            # content-length is the compressed size when the response is encoded, so it can only be checked otherwise
+            if total_size and not response.headers.get('Content-Encoding') and downloaded_size != total_size:
+                raise IOError(f"received {downloaded_size} of {total_size} bytes")
+            os.replace(part_filepath, model_filepath)
             logger.info(f"Successfully downloaded '{model_name}' filename {model_filename}.")
             return model_filepath
         except Exception as e:
-            logger.error(f"An unexpected error occurred during download of '{model_name}': {e}")
-            return None
+            try:
+                os.remove(part_filepath)
+            except OSError:
+                pass
+            raise _download_error(f"Download of '{model_name}' from {model_url} failed: {e}") from e
+
+def _auth_hint(model_url, api_key):
+    """
+    Explains how to authenticate a download that was refused.
+    """
+    if api_key:
+        return "The API key was rejected; check the 'api_key' field or the CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable."
+    if model_url.startswith("https://civitai.com"):
+        return "The model may require a Civitai API key: set the CIVITAI_TOKEN environment variable or the 'api_key' field."
+    if model_url.startswith("https://huggingface.co"):
+        return "The model may require a HuggingFace token: set the HUGGINGFACE_TOKEN environment variable or the 'api_key' field."
+    return "The model may require an API key: set the 'api_key' field."
+
+def _download_error(message):
+    """
+    Logs a download failure and returns the exception to raise, which stops the workflow and shows the message in the UI.
+    """
+    logger.error(message)
+    return RuntimeError(f"{LOG_PREFIX} {message}")
 
 def _get_model_url_from_config(model_name, model_type_key, log_missing=True):
     """
@@ -254,6 +295,22 @@ def _resolve_model_url(model_name, model_type_key, url):
             _save_model_to_config(model_type_key, model_name, url)
         return url
     return _get_model_url_from_config(model_name, model_type_key)
+
+def _get_model_file(model_name, model_type_key, url, models_subdir, api_key, download_chunks):
+    """
+    Downloads model_name if needed and returns its filename in models/<models_subdir>.
+    Raises an exception, stopping the workflow, if there is no model to load.
+    """
+    if model_name == "None":
+        raise ValueError(f"{LOG_PREFIX} No model selected ({model_type_key})")
+
+    model_url = _resolve_model_url(model_name, model_type_key, url)
+    if not model_url:
+        raise ValueError(f"{LOG_PREFIX} '{model_name}' has no download URL in config.json ({model_type_key}); enter one in the url field")
+
+    destination_dir = os.path.join(folder_paths.models_dir, models_subdir)
+    api_key = _get_api_key_for_url(model_url, api_key)
+    return os.path.basename(_download_model(model_url, model_name, destination_dir, api_key, download_chunks))
 
 def _validate_model_choice(model_name, model_type_key, url):
     """
@@ -316,19 +373,10 @@ class OnDemandLoraLoader:
     def download_lora(self, model, lora_name, strength_model, strength_clip, clip=None, api_key=None, download_chunks=None, url=None):
         self.lora_loader = LoraLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "loras")
+        if lora_name == "None":
+            return model, clip # No lora selected: pass model/clip through unchanged
 
-        lora_url = _resolve_model_url(lora_name, "loras", url)
-        if not lora_url:
-            return model, clip # Return original model/clip if URL not found
-
-        api_key = _get_api_key_for_url(lora_url, api_key)
-
-        lora_filepath = _download_model(lora_url, lora_name, destination_dir, api_key, download_chunks)
-        if not lora_filepath:
-            return model, clip # Return original model/clip if download fails
-
-        lora_filename = os.path.basename(lora_filepath)
+        lora_filename = _get_model_file(lora_name, "loras", url, "loras", api_key, download_chunks)
 
         # Load the LORA using the existing LoraLoader
         model_lora, clip_lora = self.lora_loader.load_lora(model, clip, lora_filename, strength_model, strength_clip)
@@ -368,19 +416,7 @@ class OnDemandUNETLoader:
     def download_unet(self, unet_name, weight_dtype, api_key=None, download_chunks=None, url=None):
         self.unet_loader = UNETLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "diffusion_models")
-
-        model_url = _resolve_model_url(unet_name, "diffusion_models", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, unet_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(unet_name, "diffusion_models", url, "diffusion_models", api_key, download_chunks)
 
         # Load the Model using the existing UNETLoader
         model_output = self.unet_loader.load_unet(model_filename, weight_dtype)
@@ -421,19 +457,7 @@ class OnDemandCheckpointLoader:
     def download_checkpoint(self, ckpt_name, api_key=None, download_chunks=None, url=None):
         self.checkpoint_loader = CheckpointLoaderSimple()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "checkpoints")
-
-        model_url = _resolve_model_url(ckpt_name, "checkpoints", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, ckpt_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None, None, None # Return None for all outputs if download fails
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(ckpt_name, "checkpoints", url, "checkpoints", api_key, download_chunks)
 
         # Load the checkpoint using the existing CheckpointLoaderSimple
         return self.checkpoint_loader.load_checkpoint(model_filename)
@@ -469,19 +493,7 @@ class OnDemandVAELoader:
     def download_vae(self, vae_name, api_key=None, download_chunks=None, url=None):
         self.vae_loader = VAELoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "vae")
-
-        model_url = _resolve_model_url(vae_name, "vae_models", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, vae_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None, None, None # Return None for all outputs if download fails
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(vae_name, "vae_models", url, "vae", api_key, download_chunks)
 
         # Load vae using the existing VAELoader
         return self.vae_loader.load_vae(model_filename)
@@ -517,19 +529,7 @@ class OnDemandCLIPLoader:
     def download_clip(self, clip_name, type="stable_diffusion", device="default", api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "text_encoders")
-
-        model_url = _resolve_model_url(clip_name, "clip_models", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, clip_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(clip_name, "clip_models", url, "text_encoders", api_key, download_chunks)
 
         # Load the checkpoint using the existing CheckpointLoaderSimple
         return self.clip_loader.load_clip(model_filename, type, device)
@@ -571,33 +571,8 @@ class OnDemandDualCLIPLoader:
     def download_clip(self, clip_name1, clip_name2, type, device="default", api_key=None, download_chunks=None, url1=None, url2=None):
         self.clip_loader = DualCLIPLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "text_encoders")
-
-        # clip_name1
-        model_url1 = _resolve_model_url(clip_name1, "clip_models", url1)
-        if not model_url1:
-            return None
-
-        api_key = _get_api_key_for_url(model_url1, api_key)
-
-        model_filepath1 = _download_model(model_url1, clip_name1, destination_dir, api_key, download_chunks)
-        if not model_filepath1:
-            return None
-
-        model_filename1 = os.path.basename(model_filepath1)
-
-        # clip_name2
-        model_url2 = _resolve_model_url(clip_name2, "clip_models", url2)
-        if not model_url2:
-            return None
-
-        api_key = _get_api_key_for_url(model_url2, api_key)
-
-        model_filepath2 = _download_model(model_url2, clip_name2, destination_dir, api_key, download_chunks)
-        if not model_filepath2:
-            return None
-
-        model_filename2 = os.path.basename(model_filepath2)
+        model_filename1 = _get_model_file(clip_name1, "clip_models", url1, "text_encoders", api_key, download_chunks)
+        model_filename2 = _get_model_file(clip_name2, "clip_models", url2, "text_encoders", api_key, download_chunks)
 
         return self.clip_loader.load_clip(model_filename1, model_filename2, type, device)
 
@@ -630,19 +605,7 @@ class OnDemandCLIPVisionLoader:
     def download_clip(self, clip_name, api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPVisionLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "clip_vision")
-
-        model_url = _resolve_model_url(clip_name, "clip_vision", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, clip_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(clip_name, "clip_vision", url, "clip_vision", api_key, download_chunks)
 
         return self.clip_loader.load_clip(model_filename)
 
@@ -675,24 +638,11 @@ class OnDemandGGUFLoader:
 
     def download_unet(self, unet_name, api_key=None, download_chunks=None, url=None):
         if module_gguf is None:
-            logger.error(f"UnetLoaderGGUF class not available. Ensure ComfyUI-GGUF is installed correctly.")
-            return None
+            raise RuntimeError(f"{LOG_PREFIX} UnetLoaderGGUF class not available. Ensure ComfyUI-GGUF is installed correctly.")
 
         self.gguf_loader = module_gguf.nodes.UnetLoaderGGUF()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "unet")
-
-        model_url = _resolve_model_url(unet_name, "gguf_models", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, unet_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(unet_name, "gguf_models", url, "unet", api_key, download_chunks)
 
         # Load the gguf using the existing UnetLoaderGGUF
         return self.gguf_loader.load_unet(model_filename)
@@ -728,19 +678,7 @@ class OnDemandControlNetLoader:
     def download_controlnet(self, control_net_name, api_key=None, download_chunks=None, url=None):
         self.controlnet_loader = ControlNetLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "controlnet")
-
-        model_url = _resolve_model_url(control_net_name, "controlnet_models", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, control_net_name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None # Return None for all outputs if download fails
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(control_net_name, "controlnet_models", url, "controlnet", api_key, download_chunks)
 
         # Load vae using the existing VAELoader
         return self.controlnet_loader.load_controlnet(model_filename)
@@ -777,19 +715,7 @@ class OnDemandModelPatchLoader:
     def download_model_patch(self, name, api_key=None, download_chunks=None, url=None):
         self.model_patch_loader = ModelPatchLoader()
 
-        destination_dir = os.path.join(folder_paths.models_dir, "model_patches")
-
-        model_url = _resolve_model_url(name, "model_patches", url)
-        if not model_url:
-            return None
-
-        api_key = _get_api_key_for_url(model_url, api_key)
-
-        model_filepath = _download_model(model_url, name, destination_dir, api_key, download_chunks)
-        if not model_filepath:
-            return None # Return None for all outputs if download fails
-
-        model_filename = os.path.basename(model_filepath)
+        model_filename = _get_model_file(name, "model_patches", url, "model_patches", api_key, download_chunks)
 
         # Load model_patch using the existing ModelPatchLoader
         return self.model_patch_loader.load_model_patch(model_filename)

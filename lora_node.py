@@ -13,7 +13,7 @@ import server
 from aiohttp import web
 import json
 
-from .nodes import _get_api_key_for_url, _download_model, logger
+from .nodes import _get_api_key_for_url, _download_model, logger, LOG_PREFIX
 
 API_URL = "https://civitai.com/api/v1/models?types=LORA&favorites=true&nsfw=true"
 LORA_CONFIG = None
@@ -40,7 +40,7 @@ def _fetch_data_from_api(url):
                 next_page = False
         return items    
     except Exception as e:
-        logger.error("Error in retreving data from Civitai API: {e}", e)
+        logger.error(f"Error in retreving data from Civitai API: {e}")
         return None
 
 def _transform_data_to_loras_structure(items):
@@ -133,10 +133,13 @@ class OnDemandCivitaiLikedLoraLoader:
     def download_lora(self, model, lora_name, filter, strength_model, strength_clip, clip=None, api_key=None, download_chunks=None):
         self.lora_loader = LoraLoader()
 
+        if lora_name == "None":
+            return model, clip # No lora selected: pass model/clip through unchanged
+
         global LORA_CONFIG
         LORA_CONFIG = _get_lora_config()
         if not LORA_CONFIG:
-            return model, clip # Return original model/clip if civitai api call fails
+            raise RuntimeError(f"{LOG_PREFIX} Could not fetch your liked LoRAs from the Civitai API; check the CIVITAI_TOKEN environment variable and the console log")
 
         destination_dir = os.path.join(folder_paths.models_dir, "loras")
 
@@ -147,14 +150,11 @@ class OnDemandCivitaiLikedLoraLoader:
                 break
 
         if not lora_url:
-            logger.error(f"Model URL not found for name: {lora_name} in 'loras'")
-            return model, clip # Return original model/clip if URL not found
+            raise ValueError(f"{LOG_PREFIX} '{lora_name}' was not found in your liked LoRAs on Civitai")
 
         api_key = os.environ.get('CIVITAI_TOKEN')
 
         lora_filepath = _download_model(lora_url, lora_name, destination_dir, api_key, download_chunks)
-        if not lora_filepath:
-            return model, clip # Return original model/clip if download fails
 
         lora_filename = os.path.basename(lora_filepath)
 
