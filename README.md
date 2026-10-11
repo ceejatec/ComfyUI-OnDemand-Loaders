@@ -169,6 +169,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
     - Changes to `config.json` are now used when a workflow runs without restarting ComfyUI.
     - A failed download (for example a missing or invalid `CIVITAI_TOKEN`) now stops the workflow with an error message in the UI, instead of continuing without the model.
     - Interrupted downloads no longer leave a partial model file that is later loaded as if it were complete.
+    - `CIVITAI_TOKEN` and `HUGGINGFACE_TOKEN` are now also used for the other Civitai domains (`civitai.red`, `civitai.green`) and `hf.co`.
 
 ### 1.0.17
 

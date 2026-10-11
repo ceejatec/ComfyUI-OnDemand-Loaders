@@ -9,6 +9,7 @@ import re
 import folder_paths
 from pathlib import Path
 import importlib.util
+from urllib.parse import urlparse
 import server
 from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
@@ -150,14 +151,28 @@ def _save_model_to_config(model_type_key, model_name, model_url):
     server.PromptServer.instance.send_sync("ondemand_loaders.config_updated", {"key": model_type_key, "name": model_name, "url": model_url})
     return True
 
+CIVITAI_DOMAINS = ("civitai.com", "civitai.red", "civitai.green")
+HUGGINGFACE_DOMAINS = ("huggingface.co", "hf.co")
+
+def _url_platform(model_url):
+    """
+    Returns "civitai" or "huggingface" if model_url is hosted on one of their domains (or subdomains), else None.
+    """
+    host = (urlparse(model_url).hostname or "").lower()
+    for platform, domains in (("civitai", CIVITAI_DOMAINS), ("huggingface", HUGGINGFACE_DOMAINS)):
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            return platform
+    return None
+
 def _get_api_key_for_url(model_url, api_key_param):
     """
     Determines the API key to use based on the model_url.
     It checks for a provided api_key_param first, then environment variables.
     """
-    if model_url.startswith("https://civitai.com"):
+    platform = _url_platform(model_url)
+    if platform == "civitai":
         return api_key_param or os.environ.get('CIVITAI_TOKEN')
-    elif model_url.startswith("https://huggingface.co"):
+    elif platform == "huggingface":
         return api_key_param or os.environ.get('HUGGINGFACE_TOKEN')
     else:
         return api_key_param # Return provided key if URL doesn't match known platforms
@@ -258,9 +273,10 @@ def _auth_hint(model_url, api_key):
     """
     if api_key:
         return "The API key was rejected; check the 'api_key' field or the CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable."
-    if model_url.startswith("https://civitai.com"):
+    platform = _url_platform(model_url)
+    if platform == "civitai":
         return "The model may require a Civitai API key: set the CIVITAI_TOKEN environment variable or the 'api_key' field."
-    if model_url.startswith("https://huggingface.co"):
+    if platform == "huggingface":
         return "The model may require a HuggingFace token: set the HUGGINGFACE_TOKEN environment variable or the 'api_key' field."
     return "The model may require an API key: set the 'api_key' field."
 
