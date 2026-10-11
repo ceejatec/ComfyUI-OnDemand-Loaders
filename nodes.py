@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import requests
@@ -5,7 +6,6 @@ import sys
 import logging
 import threading
 from tqdm import tqdm
-import re
 import folder_paths
 import comfy.utils
 import comfy.model_management
@@ -17,9 +17,27 @@ from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
 from comfy_extras.nodes_model_patch import ModelPatchLoader
 from .sources import get_source
+from .model_paths import (check_model_name, check_server_filename, model_extension, named_model_path,
+                          find_named_model_file, relative_model_path, server_filename)
 
 
 LOG_PREFIX = "[ComfyUI-OnDemand-Loaders]"
+
+# File extensions of model files
+MODEL_EXTENSIONS = set(folder_paths.supported_pt_extensions) | {".gguf"}
+
+# Folder in ComfyUI/models that each config.json list downloads to
+MODEL_DIRS = {
+    "loras": "loras",
+    "diffusion_models": "diffusion_models",
+    "checkpoints": "checkpoints",
+    "vae_models": "vae",
+    "clip_models": "text_encoders",
+    "clip_vision": "clip_vision",
+    "gguf_models": "unet",
+    "controlnet_models": "controlnet",
+    "model_patches": "model_patches",
+}
 
 
 logger = logging.getLogger(__name__)
@@ -170,7 +188,50 @@ def _get_api_key_for_url(model_url, api_key_param):
     return source.get_api_key(api_key_param) if source else api_key_param
 
 
-def _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256=None):
+def _request_model(model_url, model_name, api_key):
+    """
+    Starts the download request for a model and returns the streaming response. model_name may be None if not known yet.
+    Raises RuntimeError with a message for the UI if the server refuses or fails the request.
+    """
+    subject = f"'{model_name}'" if model_name else "the model"
+    headers = None
+    if api_key:
+        logger.info(f"Using provided API key")
+        headers = {
+            "Authorization": f"Bearer {api_key}"
+        }
+
+    try:
+        response = requests.get(model_url, stream=True, allow_redirects=True, headers=headers, timeout=60)
+        response.raise_for_status()  # Raise an exception for bad status codes
+    except requests.exceptions.HTTPError as e:
+        message = f"Could not download {subject} from {model_url}: HTTP {e.response.status_code} {e.response.reason}."
+        if e.response.status_code in (401, 403):
+            message += " " + _auth_hint(model_url, api_key)
+        raise _download_error(message) from e
+    except requests.exceptions.RequestException as e:
+        raise _download_error(f"Could not download {subject} from {model_url}: {e}") from e
+
+    # Sites answer some unauthenticated downloads with a login page instead of an error status
+    if response.headers.get('Content-Type', '').startswith('text/html'):
+        response.close()
+        raise _download_error(f"Could not download {subject} from {model_url}: the server returned a web page instead of a model file. "
+                              + _auth_hint(model_url, api_key))
+    return response
+
+def _get_server_filename(model_url, response):
+    """
+    Returns the filename the server provides for a download, or None if it provides none or an unsafe one.
+    """
+    filename = server_filename(model_url, response, MODEL_EXTENSIONS)
+    if filename:
+        problem = check_server_filename(filename)
+        if problem:
+            logger.warning(f"Ignoring the file name '{filename}' sent by {model_url}: {problem}")
+            return None
+    return filename
+
+def _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256=None, target_name=None):
     """
     Handles the download of a model from a given URL to a specified directory.
 
@@ -182,6 +243,8 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         download_chunks (int): The size of download chunks in KB.
         recorded_sha256 (str): SHA256 recorded for the model in config.json by an earlier download, if any.
             The download is verified against it, unless the site publishes the file's hash (see sources.py).
+        target_name (str): Model name to store the file under (see model_paths.py); it must pass check_model_name.
+            If None, the file is stored under the filename the server provides.
 
     Returns:
         tuple: The full path to the model file, and the SHA256 of the file if it was downloaded
@@ -196,49 +259,38 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         # The user expects the model to exist, so we return the assumed path.
         return os.path.join(destination_dir, model_name), None
 
-    os.makedirs(destination_dir, exist_ok=True)
+    response = _request_model(model_url, model_name, api_key)
+    model_filename = _get_server_filename(model_url, response)
 
-    headers = None
-    if api_key:
-        logger.info(f"Using provided API key")
-        headers = {
-            "Authorization": f"Bearer {api_key}"
-        }
+    if target_name:
+        extension = model_extension(target_name, MODEL_EXTENSIONS) or (os.path.splitext(model_filename)[1] if model_filename else "")
+        if not extension:
+            response.close()
+            raise _download_error(f"Could not download '{model_name}' from {model_url}: the server did not provide a file name, so the file type is unknown. "
+                                  f"Add the file's extension to the model name, for example '{target_name}.safetensors'.")
+        model_filepath = named_model_path(destination_dir, target_name, extension, MODEL_EXTENSIONS)
 
-    try:
-        response = requests.get(model_url, stream=True, allow_redirects=True, headers=headers, timeout=60)
-        response.raise_for_status()  # Raise an exception for bad status codes
-    except requests.exceptions.HTTPError as e:
-        message = f"Could not download '{model_name}' from {model_url}: HTTP {e.response.status_code} {e.response.reason}."
-        if e.response.status_code in (401, 403):
-            message += " " + _auth_hint(model_url, api_key)
-        raise _download_error(message) from e
-    except requests.exceptions.RequestException as e:
-        raise _download_error(f"Could not download '{model_name}' from {model_url}: {e}") from e
-
-    # Sites answer some unauthenticated downloads with a login page instead of an error status
-    if response.headers.get('Content-Type', '').startswith('text/html'):
-        raise _download_error(f"Could not download '{model_name}' from {model_url}: the server returned a web page instead of a model file. "
-                              + _auth_hint(model_url, api_key))
-
-    model_filename = None
-    content_disposition = response.headers.get('Content-Disposition')
-    if content_disposition:
-        filename_match = re.search(r'filename="?([^"]+)"?', content_disposition)
-        if filename_match:
-            model_filename = filename_match.group(1).strip()
-
-    if not model_filename:
-        # Fallback to extracting filename from URL if Content-Disposition is missing or malformed
-        model_filename = os.path.basename(model_url)
-
-    model_filepath = os.path.join(destination_dir, model_filename)
+        # Models downloaded before files were named after their model are stored under the server's filename.
+        # Use such a file only if its size matches, since servers give unrelated models the same name (e.g. model.safetensors).
+        legacy_filepath = os.path.join(destination_dir, model_filename) if model_filename else None
+        if legacy_filepath and legacy_filepath != model_filepath and os.path.isfile(legacy_filepath) and not os.path.exists(model_filepath):
+            total_size = int(response.headers.get('content-length', 0))
+            if not total_size or os.path.getsize(legacy_filepath) == total_size:
+                logger.info(f"Using '{model_filename}', downloaded for '{model_name}' before files were named after their model.")
+                response.close()
+                return legacy_filepath, None
+    else:
+        if not model_filename:
+            response.close()
+            raise _download_error(f"Could not download '{model_name}' from {model_url}: the server did not provide a usable file name.")
+        model_filepath = os.path.join(destination_dir, model_filename)
 
     if os.path.exists(model_filepath):
-        logger.info(f"File '{model_filename}' already exists at '{model_filepath}'. Skipping download.")
+        logger.info(f"File '{model_filepath}' already exists. Skipping download.")
         response.close()
         return model_filepath, None
     else:
+        os.makedirs(os.path.dirname(model_filepath), exist_ok=True)
         expected_sha256, expected_from = _get_expected_sha256(model_url, response, model_filename, model_name, api_key, recorded_sha256)
         logger.info(f"Downloading '{model_name}' from '{model_url}' to '{model_filepath}'")
         # Download to a temporary file, so an interrupted download is not mistaken for a complete model next time
@@ -272,7 +324,7 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
                     message += " If the file was intentionally replaced on the server, remove 'sha256' from its entry in config.json."
                 raise IOError(message)
             os.replace(part_filepath, model_filepath)
-            logger.info(f"Successfully downloaded '{model_name}' filename {model_filename}"
+            logger.info(f"Successfully downloaded '{model_name}' to '{model_filepath}'"
                         + (f" (SHA256 verified {expected_from})." if expected_sha256 else "."))
             return model_filepath, digest
         except BaseException as e:
@@ -356,9 +408,11 @@ def _resolve_model_url(model_name, model_type_key, url):
         return url
     return _get_model_url_from_config(model_name, model_type_key)
 
-def _get_model_file(model_name, model_type_key, url, models_subdir, api_key, download_chunks):
+def _get_model_file(model_name, model_type_key, url, api_key, download_chunks):
     """
-    Downloads model_name if needed and returns its filename in models/<models_subdir>.
+    Downloads model_name if needed and returns its path within its models folder (MODEL_DIRS), as ComfyUI's loaders take it.
+    The file is named after the model (see model_paths.py), unless the name cannot be used as a path; such names,
+    which can only come from editing config.json by hand, keep the filename the server provides.
     Raises an exception, stopping the workflow, if there is no model to load.
     """
     if model_name == "None":
@@ -368,21 +422,72 @@ def _get_model_file(model_name, model_type_key, url, models_subdir, api_key, dow
     if not model_url:
         raise ValueError(f"{LOG_PREFIX} '{model_name}' has no download URL in config.json ({model_type_key}); enter one in the url field")
 
-    destination_dir = os.path.join(folder_paths.models_dir, models_subdir)
+    destination_dir = os.path.join(folder_paths.models_dir, MODEL_DIRS[model_type_key])
+    problem = check_model_name(model_name)
+    target_name = None if problem else model_name
+    if problem:
+        logger.info(f"Storing '{model_name}' under the server's file name, since the model name cannot be used as one: {problem}")
+    elif model_url != "offline":
+        # Already downloaded: no need to contact the server
+        existing_filepath = find_named_model_file(destination_dir, model_name, MODEL_EXTENSIONS)
+        if existing_filepath:
+            return relative_model_path(destination_dir, existing_filepath)
+
     api_key = _get_api_key_for_url(model_url, api_key)
     recorded_sha256 = (_get_config_entry(model_name, model_type_key) or {}).get("sha256")
-    model_filepath, sha256 = _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256)
+    model_filepath, sha256 = _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256, target_name)
     if sha256 and sha256 != recorded_sha256:
         _update_config_entry(model_type_key, model_name, {"sha256": sha256})
-    return os.path.basename(model_filepath)
+    return relative_model_path(destination_dir, model_filepath)
 
 def _validate_model_choice(model_name, model_type_key, url):
     """
     VALIDATE_INPUTS helper: the model name may be any name in config.json, or a new name if a URL is given.
     """
-    if model_name == "None" or (url or "").strip() or _get_model_url_from_config(model_name, model_type_key, log_missing=False):
+    if model_name == "None" or _get_model_url_from_config(model_name, model_type_key, log_missing=False):
         return True
-    return f"'{model_name}' is not in config.json ({model_type_key}); enter its download URL in the url field"
+    if not (url or "").strip():
+        return f"'{model_name}' is not in config.json ({model_type_key}); enter its download URL in the url field"
+    problem = check_model_name(model_name)
+    if problem:
+        return f"'{model_name}' cannot be used as a model name: {problem}"
+    return True
+
+def _check_new_model(model_type_key, url, name, api_key):
+    """
+    Checks a model about to be added with the New model dialog, and returns (name, None) or (None, error message).
+    A blank name is replaced by the filename the server provides for url, which requires a request to the server.
+    """
+    destination_dir = os.path.join(folder_paths.models_dir, MODEL_DIRS[model_type_key])
+    if not url:
+        return None, "Enter the model's download URL."
+
+    if not name:
+        if url == "offline":
+            return None, "Enter a name for an offline model: the name of its file."
+        try:
+            response = _request_model(url, None, _get_api_key_for_url(url, api_key))
+        except RuntimeError as e:
+            return None, str(e).removeprefix(LOG_PREFIX).strip()
+        name = _get_server_filename(url, response)
+        response.close()
+        if not name:
+            return None, ("The server did not provide a usable file name for this URL. "
+                          "Enter a name for the model, including the file's extension (for example .safetensors).")
+        entry = _get_config_entry(name, model_type_key)
+        if entry and entry.get("url") != url:
+            return None, f"A model named '{name}' is already in config.json with a different URL. Enter a name for this one."
+        # A file under the server's own filename is most likely this model, downloaded before
+        return name, None
+
+    problem = check_model_name(name)
+    if problem:
+        return None, f"'{name}' cannot be used as a model name: {problem}."
+    # Entering the name of a model in config.json updates its URL; a new name must not match an existing file,
+    # which would be loaded instead of downloading the model
+    if not _get_config_entry(name, model_type_key) and find_named_model_file(destination_dir, name, MODEL_EXTENSIONS):
+        return None, f"A model file named '{name}' already exists in models/{MODEL_DIRS[model_type_key]}. Choose another name."
+    return name, None
 
 URL_TOOLTIP = "Download URL of the selected model, filled in from config.json. Enter a new name and URL to add the model to config.json, or change the URL to update it."
 
@@ -398,6 +503,17 @@ def _url_input(model_type_key, name_input):
 async def model_url_handler(request):
     model_url = _get_model_url_from_config(request.query.get("name"), request.query.get("key"), log_missing=False)
     return web.json_response({"url": model_url or ""})
+
+@server.PromptServer.instance.routes.post("/on_demand_loader/new_model")
+async def new_model_handler(request):
+    data = await request.json()
+    model_type_key = data.get("key")
+    if model_type_key not in MODEL_DIRS:
+        return web.json_response({"error": f"Unknown model list '{model_type_key}'"}, status=400)
+    # Looking up the server's filename makes a blocking request, so keep it off the event loop
+    name, error = await asyncio.to_thread(_check_new_model, model_type_key, (data.get("url") or "").strip(),
+                                          (data.get("name") or "").strip(), data.get("api_key") or None)
+    return web.json_response({"error": error} if error else {"name": name})
 
 
 class OnDemandLoraLoader:
@@ -440,7 +556,7 @@ class OnDemandLoraLoader:
         if lora_name == "None":
             return model, clip # No lora selected: pass model/clip through unchanged
 
-        lora_filename = _get_model_file(lora_name, "loras", url, "loras", api_key, download_chunks)
+        lora_filename = _get_model_file(lora_name, "loras", url, api_key, download_chunks)
 
         # Load the LORA using the existing LoraLoader
         model_lora, clip_lora = self.lora_loader.load_lora(model, clip, lora_filename, strength_model, strength_clip)
@@ -480,7 +596,7 @@ class OnDemandUNETLoader:
     def download_unet(self, unet_name, weight_dtype, api_key=None, download_chunks=None, url=None):
         self.unet_loader = UNETLoader()
 
-        model_filename = _get_model_file(unet_name, "diffusion_models", url, "diffusion_models", api_key, download_chunks)
+        model_filename = _get_model_file(unet_name, "diffusion_models", url, api_key, download_chunks)
 
         # Load the Model using the existing UNETLoader
         model_output = self.unet_loader.load_unet(model_filename, weight_dtype)
@@ -521,7 +637,7 @@ class OnDemandCheckpointLoader:
     def download_checkpoint(self, ckpt_name, api_key=None, download_chunks=None, url=None):
         self.checkpoint_loader = CheckpointLoaderSimple()
 
-        model_filename = _get_model_file(ckpt_name, "checkpoints", url, "checkpoints", api_key, download_chunks)
+        model_filename = _get_model_file(ckpt_name, "checkpoints", url, api_key, download_chunks)
 
         # Load the checkpoint using the existing CheckpointLoaderSimple
         return self.checkpoint_loader.load_checkpoint(model_filename)
@@ -557,7 +673,7 @@ class OnDemandVAELoader:
     def download_vae(self, vae_name, api_key=None, download_chunks=None, url=None):
         self.vae_loader = VAELoader()
 
-        model_filename = _get_model_file(vae_name, "vae_models", url, "vae", api_key, download_chunks)
+        model_filename = _get_model_file(vae_name, "vae_models", url, api_key, download_chunks)
 
         # Load vae using the existing VAELoader
         return self.vae_loader.load_vae(model_filename)
@@ -593,7 +709,7 @@ class OnDemandCLIPLoader:
     def download_clip(self, clip_name, type="stable_diffusion", device="default", api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPLoader()
 
-        model_filename = _get_model_file(clip_name, "clip_models", url, "text_encoders", api_key, download_chunks)
+        model_filename = _get_model_file(clip_name, "clip_models", url, api_key, download_chunks)
 
         # Load the checkpoint using the existing CheckpointLoaderSimple
         return self.clip_loader.load_clip(model_filename, type, device)
@@ -635,8 +751,8 @@ class OnDemandDualCLIPLoader:
     def download_clip(self, clip_name1, clip_name2, type, device="default", api_key=None, download_chunks=None, url1=None, url2=None):
         self.clip_loader = DualCLIPLoader()
 
-        model_filename1 = _get_model_file(clip_name1, "clip_models", url1, "text_encoders", api_key, download_chunks)
-        model_filename2 = _get_model_file(clip_name2, "clip_models", url2, "text_encoders", api_key, download_chunks)
+        model_filename1 = _get_model_file(clip_name1, "clip_models", url1, api_key, download_chunks)
+        model_filename2 = _get_model_file(clip_name2, "clip_models", url2, api_key, download_chunks)
 
         return self.clip_loader.load_clip(model_filename1, model_filename2, type, device)
 
@@ -669,7 +785,7 @@ class OnDemandCLIPVisionLoader:
     def download_clip(self, clip_name, api_key=None, download_chunks=None, url=None):
         self.clip_loader = CLIPVisionLoader()
 
-        model_filename = _get_model_file(clip_name, "clip_vision", url, "clip_vision", api_key, download_chunks)
+        model_filename = _get_model_file(clip_name, "clip_vision", url, api_key, download_chunks)
 
         return self.clip_loader.load_clip(model_filename)
 
@@ -706,7 +822,7 @@ class OnDemandGGUFLoader:
 
         self.gguf_loader = module_gguf.nodes.UnetLoaderGGUF()
 
-        model_filename = _get_model_file(unet_name, "gguf_models", url, "unet", api_key, download_chunks)
+        model_filename = _get_model_file(unet_name, "gguf_models", url, api_key, download_chunks)
 
         # Load the gguf using the existing UnetLoaderGGUF
         return self.gguf_loader.load_unet(model_filename)
@@ -742,7 +858,7 @@ class OnDemandControlNetLoader:
     def download_controlnet(self, control_net_name, api_key=None, download_chunks=None, url=None):
         self.controlnet_loader = ControlNetLoader()
 
-        model_filename = _get_model_file(control_net_name, "controlnet_models", url, "controlnet", api_key, download_chunks)
+        model_filename = _get_model_file(control_net_name, "controlnet_models", url, api_key, download_chunks)
 
         # Load vae using the existing VAELoader
         return self.controlnet_loader.load_controlnet(model_filename)
@@ -779,7 +895,7 @@ class OnDemandModelPatchLoader:
     def download_model_patch(self, name, api_key=None, download_chunks=None, url=None):
         self.model_patch_loader = ModelPatchLoader()
 
-        model_filename = _get_model_file(name, "model_patches", url, "model_patches", api_key, download_chunks)
+        model_filename = _get_model_file(name, "model_patches", url, api_key, download_chunks)
 
         # Load model_patch using the existing ModelPatchLoader
         return self.model_patch_loader.load_model_patch(model_filename)
