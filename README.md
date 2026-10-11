@@ -124,14 +124,14 @@ After modifying `config.json`, press "R" to reload configuration and update work
 Each config-based loader has a `url` field (`url1`/`url2` on the DualCLIP loader) that shows the download URL of the selected model from `config.json`. You can also add models without editing `config.json` by hand:
 
 1.  Click **➕ New model** on the node.
-2.  Enter the model's download URL and, optionally, a name for it, and click **Add model**. If you leave the name blank, the file name the server provides is used.
+2.  Enter the model's download URL and, optionally, a subfolder and a name for it, and click **Add model**. The subfolder field suggests the folders that already exist for that model type. If you leave the name blank, the file name the server provides is used.
 3.  Run the workflow. The model is added to `config.json` and downloaded as usual, and it appears in the dropdown of the other loaders of that type.
 
 Changing the URL of an existing model and running the workflow updates its entry in `config.json` the same way.
 
 ### Model files and folders
 
-Downloaded models are stored under their name, with the extension of the downloaded file: a LoRA named `zimage/characters/jane_doe` is saved as `ComfyUI/models/loras/zimage/characters/jane_doe.safetensors`. Use `/` in a name to organize models into folders. If a name already ends in a model extension (such as `.safetensors`), it is used as the file name as is.
+Downloaded models are stored under their name, with the extension of the downloaded file: a LoRA added with the subfolder `zimage/characters` and the name `jane_doe` is named `zimage/characters/jane_doe` in `config.json` and the drop-down, and saved as `ComfyUI/models/loras/zimage/characters/jane_doe.safetensors`. If a name already ends in a model extension (such as `.safetensors`), it is used as the file name as is.
 
 Once a model's file exists, it is loaded without contacting the server. Names must be usable as file paths on all systems: no `\ : * ? " < > |`, no `.` or `..` folders, no empty folder names, no trailing dots or spaces, and no reserved Windows names such as `CON` or `NUL`. Models downloaded by earlier versions, which are stored under the server's file name, keep being used. An entry whose name cannot be used as a file name, which can only happen by editing `config.json` by hand, also keeps using the server's file name.
 
@@ -176,7 +176,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
     - Added a `url` field to the config-based loaders, filled in from `config.json`, and a **➕ New model** button to add models to `config.json` from the node.
     - Model downloads show their progress on the node in the ComfyUI UI, and can be stopped with the Cancel button.
     - Downloads are verified against the SHA256 published by Civitai/HuggingFace or recorded by an earlier download, and the SHA256 is recorded in `config.json`.
-    - Downloaded models are stored under their model name, which can include folders (`zimage/characters/jane_doe`), and are loaded without contacting the server once present. The **➕ New model** dialog asks for the URL first; the name is optional and defaults to the server's file name.
+    - Downloaded models are stored under their model name, which can include folders (`zimage/characters/jane_doe`), and are loaded without contacting the server once present. The **➕ New model** dialog asks for the URL first, then an optional subfolder (suggesting existing folders) and an optional name, which defaults to the server's file name.
 - **Security**:
     - File names sent by servers are no longer trusted as paths, so a download cannot be written outside the models folder.
 - **Bug Fixes**:

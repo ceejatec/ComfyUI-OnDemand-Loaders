@@ -17,8 +17,8 @@ from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
 from comfy_extras.nodes_model_patch import ModelPatchLoader
 from .sources import get_source
-from .model_paths import (check_model_name, check_server_filename, model_extension, named_model_path,
-                          find_named_model_file, relative_model_path, server_filename)
+from .model_paths import (check_model_name, check_server_filename, check_subfolder, normalize_subfolder, list_subfolders,
+                          model_extension, named_model_path, find_named_model_file, relative_model_path, server_filename)
 
 
 LOG_PREFIX = "[ComfyUI-OnDemand-Loaders]"
@@ -453,14 +453,24 @@ def _validate_model_choice(model_name, model_type_key, url):
         return f"'{model_name}' cannot be used as a model name: {problem}"
     return True
 
-def _check_new_model(model_type_key, url, name, api_key):
+def _check_new_model(model_type_key, url, subfolder, name, api_key):
     """
-    Checks a model about to be added with the New model dialog, and returns (name, None) or (None, error message).
-    A blank name is replaced by the filename the server provides for url, which requires a request to the server.
+    Checks a model about to be added with the New model dialog, and returns (full name, None) or (None, error message).
+    The full name is "<subfolder>/<name>", or just the name without a subfolder. A blank name is replaced by the
+    filename the server provides for url, which requires a request to the server.
     """
     destination_dir = os.path.join(folder_paths.models_dir, MODEL_DIRS[model_type_key])
     if not url:
         return None, "Enter the model's download URL."
+
+    subfolder = normalize_subfolder(subfolder)
+    if subfolder:
+        problem = check_subfolder(subfolder)
+        if problem:
+            return None, f"The subfolder '{subfolder}' cannot be used: {problem}."
+    if "/" in name or "\\" in name:
+        return None, "Use the Subfolder field to put the model in a folder; the name cannot contain / or \\."
+    in_subfolder = lambda filename: f"{subfolder}/{filename}" if subfolder else filename
 
     if not name:
         if url == "offline":
@@ -469,17 +479,19 @@ def _check_new_model(model_type_key, url, name, api_key):
             response = _request_model(url, None, _get_api_key_for_url(url, api_key))
         except RuntimeError as e:
             return None, str(e).removeprefix(LOG_PREFIX).strip()
-        name = _get_server_filename(url, response)
+        server_name = _get_server_filename(url, response)
         response.close()
-        if not name:
+        if not server_name:
             return None, ("The server did not provide a usable file name for this URL. "
                           "Enter a name for the model, including the file's extension (for example .safetensors).")
+        name = in_subfolder(server_name)
         entry = _get_config_entry(name, model_type_key)
         if entry and entry.get("url") != url:
             return None, f"A model named '{name}' is already in config.json with a different URL. Enter a name for this one."
         # A file under the server's own filename is most likely this model, downloaded before
         return name, None
 
+    name = in_subfolder(name)
     problem = check_model_name(name)
     if problem:
         return None, f"'{name}' cannot be used as a model name: {problem}."
@@ -512,8 +524,16 @@ async def new_model_handler(request):
         return web.json_response({"error": f"Unknown model list '{model_type_key}'"}, status=400)
     # Looking up the server's filename makes a blocking request, so keep it off the event loop
     name, error = await asyncio.to_thread(_check_new_model, model_type_key, (data.get("url") or "").strip(),
-                                          (data.get("name") or "").strip(), data.get("api_key") or None)
+                                          data.get("subfolder") or "", (data.get("name") or "").strip(), data.get("api_key") or None)
     return web.json_response({"error": error} if error else {"name": name})
+
+@server.PromptServer.instance.routes.get("/on_demand_loader/subfolders")
+async def subfolders_handler(request):
+    model_type_key = request.query.get("key")
+    if model_type_key not in MODEL_DIRS:
+        return web.json_response({"error": f"Unknown model list '{model_type_key}'"}, status=400)
+    models_dir = os.path.join(folder_paths.models_dir, MODEL_DIRS[model_type_key])
+    return web.json_response({"subfolders": await asyncio.to_thread(list_subfolders, models_dir)})
 
 
 class OnDemandLoraLoader:

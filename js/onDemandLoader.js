@@ -158,16 +158,21 @@ async function promptNewModelName(node, link) {
 
 	// The backend checks the name, or gets it from the server when it is left blank
 	const apiKey = node.widgets?.find((w) => w.name === "api_key")?.value || "";
-	const check = async (url, name) => {
+	const check = async (url, subfolder, name) => {
 		const response = await api.fetchApi("/on_demand_loader/new_model", {
 			method: "POST",
-			body: JSON.stringify({ key: link.configKey, url, name, api_key: apiKey }),
+			body: JSON.stringify({ key: link.configKey, url, subfolder, name, api_key: apiKey }),
 			headers: { "Content-Type": "application/json" },
 		});
 		return response.json();
 	};
+	// Existing subfolders of this model type's folder, offered as suggestions
+	const listSubfolders = async () => {
+		const response = await api.fetchApi(`/on_demand_loader/subfolders?${new URLSearchParams({ key: link.configKey })}`);
+		return response.status === 200 ? (await response.json()).subfolders : [];
+	};
 
-	const result = await showNewModelDialog(`New ${link.nameInput}`, check);
+	const result = await showNewModelDialog(`New ${link.nameInput}`, check, listSubfolders);
 	if (!result) return;
 
 	addComboValue(nameWidget, result.name, { local: true });
@@ -176,9 +181,10 @@ async function promptNewModelName(node, link) {
 	node.setDirtyCanvas?.(true, true);
 }
 
-// Modal asking for a download URL and optional model name. check(url, name) resolves to { name } or { error };
-// the dialog resolves to { name, url }, or null if cancelled.
-function showNewModelDialog(title, check) {
+// Modal asking for a download URL, optional subfolder and optional model name. check(url, subfolder, name) resolves to
+// { name } (the full name, including the subfolder) or { error }; listSubfolders() resolves to existing subfolders.
+// The dialog resolves to { name, url }, or null if cancelled.
+function showNewModelDialog(title, check, listSubfolders) {
 	return new Promise((resolve) => {
 		const dialog = document.createElement("dialog");
 		dialog.style.cssText = `
@@ -194,9 +200,13 @@ function showNewModelDialog(title, check) {
 					<input name="url" required autocomplete="off" placeholder="https://civitai.com/api/download/models/... or https://huggingface.co/.../resolve/...">
 				</label>
 				<label style="display: flex; flex-direction: column; gap: 4px;">
+					<span>Subfolder <span style="color: var(--descrip-text, #999);">(optional)</span></span>
+					<input name="subfolder" autocomplete="off" list="ondemand-subfolders" placeholder="For example zimage/characters">
+					<datalist id="ondemand-subfolders"></datalist>
+				</label>
+				<label style="display: flex; flex-direction: column; gap: 4px;">
 					<span>Name <span style="color: var(--descrip-text, #999);">(optional)</span></span>
 					<input name="name" autocomplete="off" placeholder="Leave blank to use the file name from the server">
-					<span style="color: var(--descrip-text, #999); font-size: 12px;">Use / to put the model in a folder, e.g. zimage/characters/jane_doe</span>
 				</label>
 				<div class="ondemand-error" role="alert" style="color: var(--error-text, #ff6b6b); white-space: pre-wrap;" hidden></div>
 				<div style="display: flex; justify-content: flex-end; gap: 8px;">
@@ -224,13 +234,14 @@ function showNewModelDialog(title, check) {
 		form.addEventListener("submit", async (e) => {
 			e.preventDefault();
 			const url = form.elements.url.value.trim();
+			const subfolder = form.elements.subfolder.value.trim();
 			const name = form.elements.name.value.trim();
 			showError("");
 			form.querySelectorAll("input, button").forEach((el) => (el.disabled = true));
 			submitButton.textContent = name ? "Checking…" : "Getting file name…";
 			let checked;
 			try {
-				checked = await check(url, name);
+				checked = await check(url, subfolder, name);
 			} catch (err) {
 				checked = { error: `Could not check the model: ${err}` };
 			}
@@ -252,6 +263,17 @@ function showNewModelDialog(title, check) {
 			dialog.remove();
 			resolve(result);
 		});
+
+		listSubfolders()
+			.then((subfolders) => {
+				const datalist = dialog.querySelector("datalist");
+				for (const subfolder of subfolders) {
+					const option = document.createElement("option");
+					option.value = subfolder;
+					datalist.appendChild(option);
+				}
+			})
+			.catch((err) => console.error("[ComfyUI-OnDemand-Loaders] Failed to list subfolders", err));
 
 		document.body.appendChild(dialog);
 		dialog.showModal();

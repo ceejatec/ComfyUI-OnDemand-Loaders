@@ -18,10 +18,31 @@ def check_model_name(name):
     """
     Returns why name cannot be used as a model file path within a models folder, or None if it can.
     """
-    if not name or name != name.strip():
-        return "it is empty or starts or ends with a space"
     if name == "None":
         return "'None' is reserved for no model"
+    return _check_path(name)
+
+
+def check_subfolder(subfolder):
+    """
+    Returns why subfolder (folders separated by /) cannot be used within a models folder, or None if it can.
+    """
+    return _check_path(subfolder)
+
+
+def normalize_subfolder(subfolder):
+    """
+    Tidies a subfolder as typed by the user: \\ is accepted as a separator, and surrounding spaces and slashes are dropped.
+    """
+    return subfolder.replace("\\", "/").strip().strip("/").strip()
+
+
+def _check_path(name):
+    """
+    Returns why name (folders and file separated by /) cannot be used as a path within a models folder, or None if it can.
+    """
+    if not name or name != name.strip():
+        return "it is empty or starts or ends with a space"
     if "\\" in name:
         return "use / to separate folders"
     for part in name.split("/"):
@@ -82,6 +103,20 @@ def find_named_model_file(models_dir, name, extensions):
         if is_within(models_dir, path) and os.path.isfile(path):
             return path
     return None
+
+
+def list_subfolders(models_dir, limit=500):
+    """
+    Returns the existing subfolders of models_dir (at any depth) as sorted paths with / separators, at most limit of them.
+    """
+    subfolders = []
+    for root, dirs, _ in os.walk(models_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for d in dirs:
+            subfolders.append(relative_model_path(models_dir, os.path.join(root, d)))
+            if len(subfolders) >= limit:
+                return sorted(subfolders, key=str.lower)
+    return sorted(subfolders, key=str.lower)
 
 
 def is_within(base_dir, path):
