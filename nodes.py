@@ -11,11 +11,12 @@ import comfy.utils
 import comfy.model_management
 from pathlib import Path
 import importlib.util
-from urllib.parse import urlparse
+import hashlib
 import server
 from aiohttp import web
 from nodes import LoraLoader, UNETLoader, CheckpointLoaderSimple, VAELoader, CLIPLoader,  ControlNetLoader, DualCLIPLoader, CLIPVisionLoader
 from comfy_extras.nodes_model_patch import ModelPatchLoader
+from .sources import get_source
 
 
 LOG_PREFIX = "[ComfyUI-OnDemand-Loaders]"
@@ -115,10 +116,10 @@ def load_config(config_filename="config.json", quiet=False):
 
 _config_write_lock = threading.Lock()
 
-def _save_model_to_config(model_type_key, model_name, model_url):
+def _update_config_entry(model_type_key, model_name, changes, create=False):
     """
-    Adds a model entry to config.json, or updates the URL of an existing entry with the same name.
-    Returns True if the file was written.
+    Applies changes ({field: value}; None removes the field) to the config.json entry named model_name.
+    With create, a missing entry is added; otherwise nothing is written for it. Returns True if the file was written.
     """
     config_path = _get_config_path()
     with _config_write_lock:
@@ -134,10 +135,17 @@ def _save_model_to_config(model_type_key, model_name, model_url):
 
         models = config.setdefault(model_type_key, [])
         entry = next((m for m in models if m.get("name") == model_name), None)
-        if entry:
-            entry["url"] = model_url
-        else:
-            models.append({"name": model_name, "url": model_url})
+        created = entry is None
+        if created:
+            if not create:
+                return False
+            entry = {"name": model_name}
+            models.append(entry)
+        for field, value in changes.items():
+            if value is None:
+                entry.pop(field, None)
+            else:
+                entry[field] = value
 
         try:
             tmp_path = config_path + ".tmp"
@@ -149,38 +157,20 @@ def _save_model_to_config(model_type_key, model_name, model_url):
             logger.error(f"Error writing '{config_path}': {e}")
             return False
 
-    logger.info(f"{'Updated' if entry else 'Added'} '{model_name}' in '{model_type_key}' of {os.path.basename(config_path)}")
-    server.PromptServer.instance.send_sync("ondemand_loaders.config_updated", {"key": model_type_key, "name": model_name, "url": model_url})
+    logger.info(f"{'Added' if created else 'Updated'} '{model_name}' in '{model_type_key}' of {os.path.basename(config_path)}")
+    server.PromptServer.instance.send_sync("ondemand_loaders.config_updated", {"key": model_type_key, "name": model_name, "url": entry.get("url")})
     return True
-
-CIVITAI_DOMAINS = ("civitai.com", "civitai.red", "civitai.green")
-HUGGINGFACE_DOMAINS = ("huggingface.co", "hf.co")
-
-def _url_platform(model_url):
-    """
-    Returns "civitai" or "huggingface" if model_url is hosted on one of their domains (or subdomains), else None.
-    """
-    host = (urlparse(model_url).hostname or "").lower()
-    for platform, domains in (("civitai", CIVITAI_DOMAINS), ("huggingface", HUGGINGFACE_DOMAINS)):
-        if any(host == domain or host.endswith("." + domain) for domain in domains):
-            return platform
-    return None
 
 def _get_api_key_for_url(model_url, api_key_param):
     """
     Determines the API key to use based on the model_url.
-    It checks for a provided api_key_param first, then environment variables.
+    It checks for a provided api_key_param first, then the site's environment variable (see sources.py).
     """
-    platform = _url_platform(model_url)
-    if platform == "civitai":
-        return api_key_param or os.environ.get('CIVITAI_TOKEN')
-    elif platform == "huggingface":
-        return api_key_param or os.environ.get('HUGGINGFACE_TOKEN')
-    else:
-        return api_key_param # Return provided key if URL doesn't match known platforms
+    source = get_source(model_url)
+    return source.get_api_key(api_key_param) if source else api_key_param
 
 
-def _download_model(model_url, model_name, destination_dir, api_key, download_chunks):
+def _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256=None):
     """
     Handles the download of a model from a given URL to a specified directory.
 
@@ -190,17 +180,21 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
         destination_dir (str): The directory where the model should be saved.
         api_key (str): API key for authentication, if required.
         download_chunks (int): The size of download chunks in KB.
+        recorded_sha256 (str): SHA256 recorded for the model in config.json by an earlier download, if any.
+            The download is verified against it, unless the site publishes the file's hash (see sources.py).
 
     Returns:
-        str: The full path to the downloaded model file.
+        tuple: The full path to the model file, and the SHA256 of the file if it was downloaded
+            (None if the file already existed or the model is marked offline).
 
     Raises:
-        RuntimeError: If the model could not be downloaded; the message is shown in the ComfyUI UI.
+        RuntimeError: If the model could not be downloaded, or does not match the expected SHA256;
+            the message is shown in the ComfyUI UI.
     """
     if model_url == 'offline':
         logger.info(f"'{model_name}' is marked as offline. Assuming local file exists and skipping download.")
         # The user expects the model to exist, so we return the assumed path.
-        return os.path.join(destination_dir, model_name)
+        return os.path.join(destination_dir, model_name), None
 
     os.makedirs(destination_dir, exist_ok=True)
 
@@ -242,8 +236,10 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
 
     if os.path.exists(model_filepath):
         logger.info(f"File '{model_filename}' already exists at '{model_filepath}'. Skipping download.")
-        return model_filepath
+        response.close()
+        return model_filepath, None
     else:
+        expected_sha256, expected_from = _get_expected_sha256(model_url, response, model_filename, model_name, api_key, recorded_sha256)
         logger.info(f"Downloading '{model_name}' from '{model_url}' to '{model_filepath}'")
         # Download to a temporary file, so an interrupted download is not mistaken for a complete model next time
         part_filepath = model_filepath + ".part"
@@ -253,6 +249,7 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
             # Progress bar on the node in the ComfyUI UI; without a known size there is no progress to show
             ui_progress_bar = comfy.utils.ProgressBar(total_size) if total_size else None
             downloaded = 0
+            sha256 = hashlib.sha256()
             with tqdm(total=total_size, unit='iB', unit_scale=True, desc=f"{LOG_PREFIX} Downloading {model_name}") as progress_bar:
                 with open(part_filepath, 'wb') as f:
                     for data in response.iter_content(block_size):
@@ -260,6 +257,7 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
                         comfy.model_management.throw_exception_if_processing_interrupted()
                         progress_bar.update(len(data))
                         f.write(data)
+                        sha256.update(data)
                         downloaded += len(data)
                         if ui_progress_bar:
                             ui_progress_bar.update_absolute(downloaded)
@@ -267,9 +265,16 @@ def _download_model(model_url, model_name, destination_dir, api_key, download_ch
             # content-length is the compressed size when the response is encoded, so it can only be checked otherwise
             if total_size and not response.headers.get('Content-Encoding') and downloaded_size != total_size:
                 raise IOError(f"received {downloaded_size} of {total_size} bytes")
+            digest = sha256.hexdigest()
+            if expected_sha256 and digest != expected_sha256:
+                message = f"the file's SHA256 {digest} does not match {expected_sha256} {expected_from}."
+                if expected_from == "recorded in config.json":
+                    message += " If the file was intentionally replaced on the server, remove 'sha256' from its entry in config.json."
+                raise IOError(message)
             os.replace(part_filepath, model_filepath)
-            logger.info(f"Successfully downloaded '{model_name}' filename {model_filename}.")
-            return model_filepath
+            logger.info(f"Successfully downloaded '{model_name}' filename {model_filename}"
+                        + (f" (SHA256 verified {expected_from})." if expected_sha256 else "."))
+            return model_filepath, digest
         except BaseException as e:
             # Also clean up when cancelled: ComfyUI's InterruptProcessingException is a BaseException
             response.close()
@@ -287,14 +292,34 @@ def _auth_hint(model_url, api_key):
     """
     Explains how to authenticate a download that was refused.
     """
+    source = get_source(model_url)
+    if source:
+        return source.auth_hint(api_key)
     if api_key:
-        return "The API key was rejected; check the 'api_key' field or the CIVITAI_TOKEN/HUGGINGFACE_TOKEN environment variable."
-    platform = _url_platform(model_url)
-    if platform == "civitai":
-        return "The model may require a Civitai API key: set the CIVITAI_TOKEN environment variable or the 'api_key' field."
-    if platform == "huggingface":
-        return "The model may require a HuggingFace token: set the HUGGINGFACE_TOKEN environment variable or the 'api_key' field."
+        return "The API key was rejected; check the 'api_key' field."
     return "The model may require an API key: set the 'api_key' field."
+
+def _get_expected_sha256(model_url, response, model_filename, model_name, api_key, recorded_sha256):
+    """
+    Returns the SHA256 a download should have, and where it came from (for messages): the hash the site
+    publishes if available, else the one recorded in config.json by an earlier download, else (None, None).
+    """
+    published_sha256 = None
+    source = get_source(model_url)
+    if source:
+        try:
+            published_sha256 = source.expected_sha256(model_url, response, model_filename, api_key)
+        except Exception as e:
+            logger.warning(f"Could not get the published SHA256 of '{model_name}' from {source.name}: {e}")
+
+    if published_sha256:
+        if recorded_sha256 and recorded_sha256 != published_sha256:
+            logger.warning(f"The SHA256 {source.name} publishes for '{model_name}' differs from the one recorded in config.json; "
+                           f"the file has changed on {source.name}, so the published one is used.")
+        return published_sha256, f"published by {source.name}"
+    if recorded_sha256:
+        return recorded_sha256, "recorded in config.json"
+    return None, None
 
 def _download_error(message):
     """
@@ -303,15 +328,17 @@ def _download_error(message):
     logger.error(message)
     return RuntimeError(f"{LOG_PREFIX} {message}")
 
+def _get_config_entry(model_name, model_type_key):
+    """
+    Returns the config.json entry for a model name (re-read so edits are picked up without a restart), or None.
+    """
+    return next((model for model in load_config(quiet=True).get(model_type_key, []) if model["name"] == model_name), None)
+
 def _get_model_url_from_config(model_name, model_type_key, log_missing=True):
     """
-    Retrieves the URL for a given model name from config.json (re-read so edits are picked up without a restart).
+    Retrieves the URL for a given model name from config.json.
     """
-    model_url = None
-    for model in load_config(quiet=True).get(model_type_key, []):
-        if model["name"] == model_name:
-            model_url = model["url"]
-            break
+    model_url = (_get_config_entry(model_name, model_type_key) or {}).get("url")
     if not model_url and log_missing:
         logger.error(f"Model URL not found for name: {model_name} in {model_type_key}")
     return model_url
@@ -324,7 +351,8 @@ def _resolve_model_url(model_name, model_type_key, url):
     url = (url or "").strip()
     if url and model_name != "None":
         if _get_model_url_from_config(model_name, model_type_key, log_missing=False) != url:
-            _save_model_to_config(model_type_key, model_name, url)
+            # A recorded hash belongs to the old URL's file
+            _update_config_entry(model_type_key, model_name, {"url": url, "sha256": None}, create=True)
         return url
     return _get_model_url_from_config(model_name, model_type_key)
 
@@ -342,7 +370,11 @@ def _get_model_file(model_name, model_type_key, url, models_subdir, api_key, dow
 
     destination_dir = os.path.join(folder_paths.models_dir, models_subdir)
     api_key = _get_api_key_for_url(model_url, api_key)
-    return os.path.basename(_download_model(model_url, model_name, destination_dir, api_key, download_chunks))
+    recorded_sha256 = (_get_config_entry(model_name, model_type_key) or {}).get("sha256")
+    model_filepath, sha256 = _download_model(model_url, model_name, destination_dir, api_key, download_chunks, recorded_sha256)
+    if sha256 and sha256 != recorded_sha256:
+        _update_config_entry(model_type_key, model_name, {"sha256": sha256})
+    return os.path.basename(model_filepath)
 
 def _validate_model_choice(model_name, model_type_key, url):
     """

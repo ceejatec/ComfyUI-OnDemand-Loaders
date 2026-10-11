@@ -129,6 +129,10 @@ Each config-based loader has a `url` field (`url1`/`url2` on the DualCLIP loader
 
 Changing the URL of an existing model and running the workflow updates its entry in `config.json` the same way.
 
+### Download verification
+
+When a model is downloaded, its SHA256 hash is recorded in its `config.json` entry as `sha256`. Downloads are verified against the hash that Civitai or HuggingFace publishes for the file, or, for other sites, against the hash recorded by an earlier download. A download that does not match is discarded and the workflow stops with an error. If a model was intentionally replaced on a site that does not publish hashes, remove `sha256` from its entry. Changing a model's URL also removes its recorded hash.
+
 ### Using the `OnDemand Civitai Liked Lora Loader`
 
 This special node works differently from the others. Instead of using the local `config.json` file, it connects directly to the Civitai API to fetch the list of LoRA models you have marked as "Favorites".
@@ -165,6 +169,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 - **New Feature**:
     - Added a `url` field to the config-based loaders, filled in from `config.json`, and a **➕ New model** button to add models to `config.json` from the node.
     - Model downloads show their progress on the node in the ComfyUI UI, and can be stopped with the Cancel button.
+    - Downloads are verified against the SHA256 published by Civitai/HuggingFace or recorded by an earlier download, and the SHA256 is recorded in `config.json`.
 - **Bug Fixes**:
     - Fixed a crash at startup when ComfyUI-GGUF is not installed.
     - Changes to `config.json` are now used when a workflow runs without restarting ComfyUI.

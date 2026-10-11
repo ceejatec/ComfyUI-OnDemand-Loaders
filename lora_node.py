@@ -154,7 +154,7 @@ class OnDemandCivitaiLikedLoraLoader:
 
         api_key = os.environ.get('CIVITAI_TOKEN')
 
-        lora_filepath = _download_model(lora_url, lora_name, destination_dir, api_key, download_chunks)
+        lora_filepath, _ = _download_model(lora_url, lora_name, destination_dir, api_key, download_chunks)
 
         lora_filename = os.path.basename(lora_filepath)
 
