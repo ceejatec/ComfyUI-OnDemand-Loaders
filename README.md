@@ -135,6 +135,10 @@ Downloaded models are stored under their name, with the extension of the downloa
 
 Once a model's file exists, it is loaded without contacting the server. Names must be usable as file paths on all systems: no `\ : * ? " < > |`, no `.` or `..` folders, no empty folder names, no trailing dots or spaces, and no reserved Windows names such as `CON` or `NUL`. Models downloaded by earlier versions, which are stored under the server's file name, keep being used. An entry whose name cannot be used as a file name, which can only happen by editing `config.json` by hand, also keeps using the server's file name.
 
+### Local models
+
+The drop-down also lists model files that are already in ComfyUI's model folders (including folders from `extra_model_paths.yaml`) but not in `config.json`, after the configured models and marked `[local]`, such as `[local] sdxl/my_lora.safetensors`. Selecting one shows `<local>` in the `url` field, and the file is loaded as is, without contacting any server. Files that belong to a `config.json` entry (named after it) are not listed again. Models downloaded by earlier versions, stored under the server's file name, are listed as local as well as under their `config.json` name; renaming such a file to its model name removes the duplicate.
+
 ### Download verification
 
 When a model is downloaded, its SHA256 hash is recorded in its `config.json` entry as `sha256`. Downloads are verified against the hash that Civitai or HuggingFace publishes for the file, or, for other sites, against the hash recorded by an earlier download. A download that does not match is discarded and the workflow stops with an error. If a model was intentionally replaced on a site that does not publish hashes, remove `sha256` from its entry. Changing a model's URL also removes its recorded hash.
@@ -177,6 +181,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
     - Model downloads show their progress on the node in the ComfyUI UI, and can be stopped with the Cancel button.
     - Downloads are verified against the SHA256 published by Civitai/HuggingFace or recorded by an earlier download, and the SHA256 is recorded in `config.json`.
     - Downloaded models are stored under their model name, which can include folders (`zimage/characters/jane_doe`), and are loaded without contacting the server once present. The **➕ New model** dialog asks for the URL first, then an optional subfolder (suggesting existing folders) and an optional name, which defaults to the server's file name.
+    - The drop-downs also list local model files that are not in `config.json`, marked `[local]`; they are loaded without contacting any server.
 - **Security**:
     - File names sent by servers are no longer trusted as paths, so a download cannot be written outside the models folder.
 - **Bug Fixes**:

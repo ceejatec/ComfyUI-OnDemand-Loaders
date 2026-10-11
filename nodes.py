@@ -39,6 +39,25 @@ MODEL_DIRS = {
     "model_patches": "model_patches",
 }
 
+# ComfyUI folder (folder_paths key) whose files are offered as local models for each config.json list;
+# it covers ComfyUI's other folders for that type and extra_model_paths.yaml too
+MODEL_FOLDER_KEYS = {
+    "loras": "loras",
+    "diffusion_models": "diffusion_models",
+    "checkpoints": "checkpoints",
+    "vae_models": "vae",
+    "clip_models": "text_encoders",
+    "clip_vision": "clip_vision",
+    "gguf_models": "unet_gguf",  # Registered by ComfyUI-GGUF
+    "controlnet_models": "controlnet",
+    "model_patches": "model_patches",
+}
+
+# Drop-down entries for model files that are on disk but not in config.json start with LOCAL_PREFIX,
+# and the url field shows LOCAL_URL for them
+LOCAL_PREFIX = "[local] "
+LOCAL_URL = "<local>"
+
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -401,12 +420,51 @@ def _resolve_model_url(model_name, model_type_key, url):
     saved to config.json if it is new or differs from the configured one; otherwise config.json is used.
     """
     url = (url or "").strip()
+    if url == LOCAL_URL:
+        url = "" # Left over from selecting a local file
     if url and model_name != "None":
         if _get_model_url_from_config(model_name, model_type_key, log_missing=False) != url:
             # A recorded hash belongs to the old URL's file
             _update_config_entry(model_type_key, model_name, {"url": url, "sha256": None}, create=True)
         return url
     return _get_model_url_from_config(model_name, model_type_key)
+
+def _local_files(model_type_key):
+    """
+    Returns the model files ComfyUI finds for a config.json list, as paths relative to their folder with / separators.
+    """
+    folder_key = MODEL_FOLDER_KEYS[model_type_key]
+    if folder_key not in folder_paths.folder_names_and_paths:
+        return []
+    return [path.replace("\\", "/") for path in folder_paths.get_filename_list(folder_key)]
+
+def _model_choices(model_type_key):
+    """
+    The drop-down entries for a config.json list: its models, then the local model files that do not belong to any of them.
+    A model's file is named after it (see model_paths.py): the name itself, or the name plus a model extension.
+    """
+    names = [model["name"] for model in load_config().get(model_type_key, [])]
+    owned = {os.path.normcase(name) for name in names}
+    local = [LOCAL_PREFIX + path for path in _local_files(model_type_key)
+             if os.path.normcase(path) not in owned and os.path.normcase(os.path.splitext(path)[0]) not in owned]
+    return names + local
+
+def _local_model_path(model_name):
+    """
+    Returns the file path of a local drop-down entry ("[local] <path>"), or None if model_name is not one.
+    """
+    return model_name[len(LOCAL_PREFIX):] if model_name.startswith(LOCAL_PREFIX) else None
+
+def _local_model_problem(local_path, model_type_key):
+    """
+    Returns why a local model file cannot be loaded, or None if it can.
+    """
+    folder_key = MODEL_FOLDER_KEYS[model_type_key]
+    if folder_key not in folder_paths.folder_names_and_paths:
+        return f"local {MODEL_DIRS[model_type_key]} models are not available"
+    if not folder_paths.get_full_path(folder_key, local_path):
+        return f"the file '{local_path}' was not found in models/{MODEL_DIRS[model_type_key]}"
+    return None
 
 def _get_model_file(model_name, model_type_key, url, api_key, download_chunks):
     """
@@ -417,6 +475,14 @@ def _get_model_file(model_name, model_type_key, url, api_key, download_chunks):
     """
     if model_name == "None":
         raise ValueError(f"{LOG_PREFIX} No model selected ({model_type_key})")
+
+    # Local files are loaded as they are; the url field does not apply to them
+    local_path = _local_model_path(model_name)
+    if local_path is not None:
+        problem = _local_model_problem(local_path, model_type_key)
+        if problem:
+            raise ValueError(f"{LOG_PREFIX} Cannot load '{model_name}': {problem}")
+        return local_path
 
     model_url = _resolve_model_url(model_name, model_type_key, url)
     if not model_url:
@@ -442,11 +508,15 @@ def _get_model_file(model_name, model_type_key, url, api_key, download_chunks):
 
 def _validate_model_choice(model_name, model_type_key, url):
     """
-    VALIDATE_INPUTS helper: the model name may be any name in config.json, or a new name if a URL is given.
+    VALIDATE_INPUTS helper: the model name may be any name in config.json, a local model file, or a new name if a URL is given.
     """
     if model_name == "None" or _get_model_url_from_config(model_name, model_type_key, log_missing=False):
         return True
-    if not (url or "").strip():
+    local_path = _local_model_path(model_name)
+    if local_path is not None:
+        problem = _local_model_problem(local_path, model_type_key)
+        return f"Cannot load '{model_name}': {problem}" if problem else True
+    if (url or "").strip() in ("", LOCAL_URL):
         return f"'{model_name}' is not in config.json ({model_type_key}); enter its download URL in the url field"
     problem = check_model_name(model_name)
     if problem:
@@ -495,10 +565,14 @@ def _check_new_model(model_type_key, url, subfolder, name, api_key):
     problem = check_model_name(name)
     if problem:
         return None, f"'{name}' cannot be used as a model name: {problem}."
+    if name.startswith(LOCAL_PREFIX):
+        return None, f"Model names cannot start with '{LOCAL_PREFIX.strip()}', which marks local files in the drop-down."
     # Entering the name of a model in config.json updates its URL; a new name must not match an existing file,
     # which would be loaded instead of downloading the model
-    if not _get_config_entry(name, model_type_key) and find_named_model_file(destination_dir, name, MODEL_EXTENSIONS):
-        return None, f"A model file named '{name}' already exists in models/{MODEL_DIRS[model_type_key]}. Choose another name."
+    existing_filepath = None if _get_config_entry(name, model_type_key) else find_named_model_file(destination_dir, name, MODEL_EXTENSIONS)
+    if existing_filepath:
+        return None, (f"A model file named '{name}' already exists in models/{MODEL_DIRS[model_type_key]}. Choose another name, "
+                      f"or cancel and select '{LOCAL_PREFIX}{relative_model_path(destination_dir, existing_filepath)}' to use the file.")
     return name, None
 
 URL_TOOLTIP = "Download URL of the selected model, filled in from config.json. Enter a new name and URL to add the model to config.json, or change the URL to update it."
@@ -513,7 +587,10 @@ def _url_input(model_type_key, name_input):
 
 @server.PromptServer.instance.routes.get("/on_demand_loader/model_url")
 async def model_url_handler(request):
-    model_url = _get_model_url_from_config(request.query.get("name"), request.query.get("key"), log_missing=False)
+    model_name = request.query.get("name") or ""
+    if _local_model_path(model_name) is not None:
+        return web.json_response({"url": LOCAL_URL})
+    model_url = _get_model_url_from_config(model_name, request.query.get("key"), log_missing=False)
     return web.json_response({"url": model_url or ""})
 
 @server.PromptServer.instance.routes.post("/on_demand_loader/new_model")
@@ -541,8 +618,7 @@ class OnDemandLoraLoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        loras = [lora["name"] for lora in NODE_CONFIG.get("loras", []) ]
+        loras = _model_choices("loras")
 
         return {
             "required": {
@@ -588,8 +664,7 @@ class OnDemandUNETLoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("diffusion_models", []) ]
+        models = _model_choices("diffusion_models")
 
         return {
             "required": {
@@ -628,8 +703,7 @@ class OnDemandCheckpointLoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("checkpoints", []) ]
+        models = _model_choices("checkpoints")
 
         return {
             "required": {
@@ -667,8 +741,7 @@ class OnDemandVAELoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("vae_models", []) ]
+        models = _model_choices("vae_models")
 
         return {
             "required": {
@@ -703,8 +776,7 @@ class OnDemandCLIPLoader:
     @classmethod
     def INPUT_TYPES(s):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("clip_models", []) ]
+        models = _model_choices("clip_models")
 
         return {"required": {
                                 "clip_name": (models,),
@@ -740,8 +812,7 @@ class OnDemandDualCLIPLoader:
     @classmethod
     def INPUT_TYPES(s):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("clip_models", []) ]
+        models = _model_choices("clip_models")
 
         return {"required": {
                                 "clip_name1": (models,),
@@ -781,8 +852,7 @@ class OnDemandCLIPVisionLoader:
     @classmethod
     def INPUT_TYPES(s):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("clip_vision", []) ]
+        models = _model_choices("clip_vision")
 
         return {"required": {
                                 "clip_name": (models,),
@@ -815,8 +885,7 @@ class OnDemandGGUFLoader:
     @classmethod
     def INPUT_TYPES(s):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("gguf_models", []) ]
+        models = _model_choices("gguf_models")
 
         return {"required": {
                                 "unet_name": (models,)
@@ -852,8 +921,7 @@ class OnDemandControlNetLoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("controlnet_models", []) ]
+        models = _model_choices("controlnet_models")
 
         return {
             "required": {
@@ -889,8 +957,7 @@ class OnDemandModelPatchLoader:
     @classmethod
     def INPUT_TYPES(cls):
 
-        NODE_CONFIG = load_config()
-        models = [model["name"] for model in NODE_CONFIG.get("model_patches", []) ]
+        models = _model_choices("model_patches")
 
         return {
             "required": {
