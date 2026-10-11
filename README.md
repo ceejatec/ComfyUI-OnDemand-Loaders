@@ -184,7 +184,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 
 ## Changelog
 
-### Unreleased
+### 1.1.1
 
 - **New Feature**:
     - Export and import models from a loader node's right-click menu: export one section or all of `config.json`, and merge an exported file into it after reviewing a summary.
