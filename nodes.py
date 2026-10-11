@@ -48,7 +48,7 @@ if module_path.exists():
 
 else:
     # Handle the missing file case gracefully
-    logger.warning(f"ComfyUI-GGUF installation not found! Expected location: {module_path.as_posix().parent}")
+    logger.warning(f"ComfyUI-GGUF installation not found! Expected location: {module_path.parent.as_posix()}")
     logger.warning(f"OnDemand GGUF Loaders will not be available")
 
 
