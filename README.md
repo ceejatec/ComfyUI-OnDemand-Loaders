@@ -184,7 +184,7 @@ This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https
 
 ## Changelog
 
-### Unreleased
+### 1.1.2
 
 - **Changes**:
     - `OnDemand UNET Loader` is now called `OnDemand Diffusion Model Loader`, matching ComfyUI's `Load Diffusion Model`; existing workflows are unaffected.
