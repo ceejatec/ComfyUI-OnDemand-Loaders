@@ -17,7 +17,7 @@ NODE_CLASS_MAPPINGS = {
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "OnDemandLoraLoader": "OnDemand Lora Loader",
-    "OnDemandUNETLoader": "OnDemand UNET Loader",
+    "OnDemandUNETLoader": "OnDemand Diffusion Model Loader",
     "OnDemandCheckpointLoader": "OnDemand Checkpoint Loader",
     "OnDemandVAELoader": "OnDemand VAE Loader",
     "OnDemandCLIPLoader": "OnDemand CLIP Loader",

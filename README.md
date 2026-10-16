@@ -19,7 +19,7 @@ This package includes the following nodes:
 *   `OnDemand Civitai Liked Lora Loader`
 *   `OnDemand Checkpoint Loader`
 *   `OnDemand VAE Loader`
-*   `OnDemand UNET Loader`
+*   `OnDemand Diffusion Model Loader` (formerly `OnDemand UNET Loader`)
 *   `OnDemand CLIP Loader`
 *   `OnDemand ControlNet Loader`
 *   `OnDemand GGUF Loader` (Note: Requires [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) to be installed.)
@@ -183,6 +183,12 @@ This project is licensed under the MIT License. See the [LICENSE.txt](LICENSE.tx
 This project uses JavaScript and CSS code from [Comfyui-Resolution-Master](https://github.com/Azornes/Comfyui-Resolution-Master) by Azornes.
 
 ## Changelog
+
+### Unreleased
+
+- **Changes**:
+    - `OnDemand UNET Loader` is now called `OnDemand Diffusion Model Loader`, matching ComfyUI's `Load Diffusion Model`; existing workflows are unaffected.
+    - The `type` options of the CLIP and DualCLIP loaders, and the diffusion model loader's `weight_dtype`, now come from ComfyUI's own loaders, so they match the installed ComfyUI version (adding `krea2`, `flux2` and others).
 
 ### 1.1.1
 

@@ -591,6 +591,14 @@ def _check_new_model(model_type_key, url, subfolder, name, api_key):
                       f"or cancel and select '{LOCAL_PREFIX}{relative_model_path(destination_dir, existing_filepath)}' to use the file.")
     return name, None
 
+def _core_input(node_class, input_name):
+    """
+    Returns a core loader node's definition of one of its inputs (such as CLIPLoader's "type"), so the options
+    offered here always match the ComfyUI version in use.
+    """
+    input_types = node_class.INPUT_TYPES()
+    return input_types.get("required", {}).get(input_name) or input_types.get("optional", {})[input_name]
+
 URL_TOOLTIP = "Download URL of the selected model, filled in from config.json. Enter a new name and URL to add the model to config.json, or change the URL to update it."
 
 def _url_input(model_type_key, name_input):
@@ -739,7 +747,7 @@ class OnDemandUNETLoader:
         return {
             "required": {
                 "unet_name": (models,),
-                "weight_dtype": (["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],)
+                "weight_dtype": _core_input(UNETLoader, "weight_dtype")
             },
             "optional": {
                 "api_key": ("STRING", {"default": None, "multiline": False}),
@@ -850,7 +858,7 @@ class OnDemandCLIPLoader:
 
         return {"required": {
                                 "clip_name": (models,),
-                                "type": (["stable_diffusion", "stable_cascade", "sd3", "stable_audio", "mochi", "ltxv", "pixart", "cosmos", "lumina2", "wan", "hidream", "chroma", "ace", "omnigen2", "qwen_image", "hunyuan_image"], ),
+                                "type": _core_input(CLIPLoader, "type"),
                               },
                 "optional": {
                                 "device": (["default", "cpu"], {"advanced": True}),
@@ -887,7 +895,7 @@ class OnDemandDualCLIPLoader:
         return {"required": {
                                 "clip_name1": (models,),
                                 "clip_name2": (models,),
-                                "type": (["sdxl", "sd3", "flux", "hunyuan_video", "hidream", "hunyuan_image", "hunyuan_video_15"], ),
+                                "type": _core_input(DualCLIPLoader, "type"),
                               },
                 "optional": {
                                 "device": (["default", "cpu"], {"advanced": True}),
